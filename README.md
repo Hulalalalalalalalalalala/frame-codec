@@ -104,6 +104,89 @@ After recovery the first `Flush` re-sends every frame past the resume
 point; backlogs wider than the window drain as acks refill the freed
 tail slots from the log.
 
+## Multiplexed channels
+
+`codec.NewMux(rel *ReliableSession, cfg MuxConfig) (*Mux, error)` wraps
+one reliable session with a multiplexing layer carrying several
+independent logical channels. The layers below are not changed: every
+multiplexed message is the payload of one reliable data frame, prefixed
+by this layer's own 15-byte header, so the single-frame format, the
+reliable envelope and all established entries, constants and error
+values keep their exact byte-level semantics.
+
+The mux header inside a reliable payload is
+`chan (2) | seq (4) | fl (1) | ack (4) | crc32 (4) | payload`, all
+multi-byte fields big-endian; the CRC is IEEE CRC-32 over the other 11
+header bytes and the payload. `fl` is `1` for a channel's FIN entry and
+`2` for a pure cumulative acknowledgement. `MuxHeaderSize` (15) bytes
+are reserved, so the inner payload limit is
+`MuxMaxPayload = ReliableMaxPayload - MuxHeaderSize`.
+
+- `MuxConfig{Channels int; Window int; StateDir string}`: the number of
+  channels (numbered `0..Channels-1`), the per-channel in-flight quota
+  in frames (also the receive-side reach), and a directory for write
+  state (one dual-slot checkpoint file per channel plus a shared replay
+  journal); it is created if missing.
+- `ChannelFrame{Channel uint16; Flags uint16; Kind uint8; Payload []byte}`
+  is the caller-visible frame.
+- `(*Mux).WriteFrame(ChannelFrame) error` opens the channel on its first
+  write, numbers the frame with that channel's next sequence, journals
+  it and queues it; nothing goes out before `Flush`. It returns
+  `ErrTooLarge` for a payload over `MuxMaxPayload`, the established
+  checksum value for a channel number outside the session,
+  `ErrWindowFull` (the same sentinel as `ErrTooLarge`) when the channel
+  already holds `Window` unacknowledged entries, and `ErrChannelClosed`
+  on a closed channel. A rejected frame is neither queued nor journaled
+  and consumes no sequence, so it takes no quota; the buffered backlog
+  stays bounded by `Channels*Window` entries.
+- `(*Mux).CloseChannel(ch uint16) error` queues the channel's FIN; the
+  FIN is itself a numbered entry and consumes one quota slot, so a full
+  quota returns `ErrWindowFull` and the caller retries after acks.
+  Closing a never-written channel opens it with a bare FIN; writing to
+  or closing an already closed channel returns `ErrChannelClosed`.
+- `(*Mux).Flush() error` sends the queued entries with transmission
+  opportunities handed out round-robin across channels (each pass takes
+  at most one entry per channel), so one continuously busy channel can
+  never starve the others. Every entry piggybacks its channel's current
+  cumulative receive position; after a restart the queue is reloaded
+  from the journal, so `Flush` is also the retransmit operation.
+- `(*Mux).ReadFrame() (ChannelFrame, error)` delivers each channel's
+  frames in write order exactly once; channels are independent, so a gap
+  on one channel never blocks another. When a channel's FIN is reached,
+  the call returns `(ChannelFrame{Channel: ch}, io.EOF)`; reads on other
+  channels continue. A channel number out of range, a residual frame
+  older than one channel-window or more than one width ahead, an
+  acknowledgement past the send frontier, a same-sequence retransmission
+  with different content, a malformed acknowledgement/FIN, an unknown
+  flag, or a damaged mux header is refused with `ErrChecksum` (a header
+  too short to parse gives `ErrShortFrame`), stopping delivery stickily
+  at the current positions. Reliable-layer results (`io.EOF`,
+  `ErrShortFrame`, outer checksum/version/size and reader errors) pass
+  through unchanged, and complete frames already buffered are delivered
+  before a terminal lower-layer result surfaces.
+
+Standalone acks are sent by a small background pump, so - as on the
+reliable layer - a writer that needs the peer's acks to release quota
+must let `ReadFrame` run.
+
+### Mux restart recovery
+
+Accepted entries are recorded in one strict, CRC'd journal
+(`mux.log`) shared by all channels; each channel's confirmed position is
+recorded in its own dual-slot checkpoint (`muxNNN.ckp`), alternating
+slots with a higher generation on every save:
+
+- a torn checkpoint fails its own CRC and is ignored in favor of the
+  previous complete record;
+- a truncated journal, a flipped bit, a per-channel gap or duplicate,
+  an entry past a FIN, or a journaled channel out of range fails
+  recovery with `ErrChecksum` rather than replaying unverified frames;
+- reconciliation resumes each channel from the earlier of the
+  checkpoint and the journal tail, so an unacknowledged frame is never
+  skipped and the receiver deduplicates the overlap;
+- a confirmed FIN stays in the journal as the durable close marker, so a
+  channel that closed before a restart stays closed afterwards.
+
 ## Tests
 
     go test ./...
