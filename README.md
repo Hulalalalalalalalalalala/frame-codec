@@ -43,6 +43,48 @@ Reads and writes are independently serialized, so one session may be
 shared by concurrent writers and readers; the bytes of a single frame
 are never interleaved.
 
+## Reliable transfer layer
+
+`codec.NewReliableSession(sess *Session, window int, checkpointPath, logPath string) (*ReliableSession, error)`
+wraps an existing session in sequence numbers, cumulative
+acknowledgements and a sliding window, with optional crash-restart
+continuation. The underlying single-frame encoding is unchanged: the
+new headers live in this layer's own payload convention, carried by
+ordinary underlying frames (`Kind` `0xF0` = DATA with
+`seq|flags|kind|length|payload`, `Kind` `0xF1` = ACK with one
+cumulative `ackSeq`).
+
+- `(*ReliableSession).WriteFrame(Frame) error` numbers the frame,
+  appends it durably to the replay log (when persistent) before it can
+  reach the wire, and keeps it pending until a cumulative ACK covers
+  it. A write while `[base, base+window)` is full, or whose inner
+  payload would exceed the unchanged outer `MaxPayload`, returns
+  `ErrTooLarge` and drops that frame without taking a sequence slot.
+- `(*ReliableSession).Flush() error` pushes buffered DATA frames;
+  `(*ReliableSession).Retransmit() error` resends every unacked frame
+  with its original sequence number.
+- `(*ReliableSession).ReadFrame() (Frame, error)` delivers frames in
+  write order exactly once. Duplicates are re-ACKed but not delivered,
+  in-window out-of-order frames are parked until the gap closes, and a
+  pre-wrap residue or a declared sequence at/beyond
+  `deliverNext+window` (or any malformed inner frame) fails with
+  `ErrChecksum`; the error is sticky and delivery stops at the last
+  frame already handed to the caller. `io.EOF` after queued frames are
+  drained behaves as on `Session`.
+
+### Crash recovery
+
+When checkpoint and log paths are given (both or neither), every
+accepted write is appended to the replay log with its own checksum
+before going on the wire, and every ACK advance first atomically
+publishes a checkpoint record (temp file + `rename`, so a half-written
+checkpoint is recognized and the previous complete one is used) and
+only then compacts the log. On restart the sender resumes from the
+earliest position still held by checkpoint/log — already-acked frames
+are never resent, a redelivered unacked range is replayed once and
+deduplicated, and a checkpoint/log disagreement never skips or repeats
+a frame. A truncated or bit-flipped log or committed checkpoint fails
+recovery with `ErrChecksum` instead of continuing.
 
 ## Tests
 
