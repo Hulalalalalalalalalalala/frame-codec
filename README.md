@@ -104,6 +104,75 @@ After recovery the first `Flush` re-sends every frame past the resume
 point; backlogs wider than the window drain as acks refill the freed
 tail slots from the log.
 
+## Channel multiplexing
+
+`codec.NewMux(rel *ReliableSession, cfg MuxConfig) (*Mux, error)`
+carries several independent logical channels over one reliable
+session. The lower wire format is not changed: every multiplexed
+message is the payload of one reliable data frame, prefixed by this
+layer's own 15-byte header
+(`chan uint16`, `seq uint32`, `flags uint8`, `ack uint32`, `crc32`),
+so the reliable envelope, the codec frame, the header constants and
+all established error values keep their exact semantics.
+
+- `MuxConfig{Channels int; Window int; StateDir string}`: the number of
+  channels (numbered `0..Channels-1`), the per-channel in-flight quota
+  in frames (enforced independently), and a write-side state directory
+  (per-channel dual-slot checkpoints, a shared replay journal and
+  per-channel close markers), created if missing.
+- `ChannelFrame{Channel uint16; Flags uint16; Kind uint8; Payload []byte}`
+  is the caller-visible frame. `MuxHeaderSize` (15) bytes are reserved
+  inside the reliable payload, so the inner payload limit is
+  `MuxMaxPayload = ReliableMaxPayload - MuxHeaderSize`.
+- `(*Mux).WriteFrame(ChannelFrame) error` numbers frames per channel in
+  write order, journals each one and parks it in the channel's quota;
+  nothing goes out before `Flush`. A full per-channel quota returns the
+  established over-limit sentinel `ErrWindowFull` (the same value as
+  `ErrTooLarge`); an oversized payload returns `ErrTooLarge`. A rejected
+  frame is neither queued nor journaled and consumes no sequence, so it
+  takes no quota; total buffering is bounded by `Channels*Window`.
+  Writing to a closed channel returns the new sentinel
+  `ErrChannelClosed`; an out-of-range channel returns `ErrChecksum`.
+- `(*Mux).CloseChannel(ch) error` closes one channel's write side: the
+  FIN is itself a sequence entry (it takes one quota slot, so a full
+  quota gives `ErrWindowFull` and the close is retried after acks); a
+  channel that was never written is opened first, so an unused channel
+  still delivers a clean EOF. Closing or writing an already closed
+  channel returns `ErrChannelClosed`.
+- `(*Mux).Flush() error` sends queued frames round-robin across
+  channels (each pass serves at most one queued frame per channel,
+  starting where the previous Flush stopped), so one busy channel can
+  never starve another and a channel's frames never pass its own
+  earlier frames. Every frame piggybacks the sender's current
+  cumulative receive position for its channel; cumulative
+  acknowledgements are also sent by a small background pump. As on the
+  reliable layer, a writer that needs the peer's acks to drain quotas
+  must let `ReadFrame` run.
+- `(*Mux).ReadFrame() (ChannelFrame, error)` delivers across all
+  channels: a gap-blocked channel never stalls another channel, while
+  within a channel frames arrive in write order exactly once. After a
+  channel's remaining frames, the read that reaches its FIN returns the
+  `ChannelFrame` naming the channel together with `io.EOF`; other
+  channels keep flowing. A channel number outside the session's reach,
+  a residual older than one channel-window, a declaration more than one
+  window ahead, an acknowledgement past the send frontier, a
+  same-sequence retransmission with different content, an unknown flag,
+  an ack carrying payload, or a damaged header is refused with
+  `ErrChecksum`, stopping stickily at the current delivery positions.
+  Reliable-layer results (`io.EOF`, `ErrShortFrame`, outer
+  checksum/version/size and reader errors) pass through unchanged; when
+  a terminal lower-layer read also brings complete frames, the buffered
+  frames are delivered first.
+
+Restart uses the same durable rules as the reliable layer: written data
+frames are CRC-recorded in a shared journal (`mux.log`), acknowledged
+per-channel positions in dual-slot checkpoints (`muxNNN.ckp`), and a
+close marker (`muxNNN.closed`) survives a FIN whose journal prefix was
+discarded. Recovery resumes each channel at the earlier of the
+checkpoint and journal positions, so no unacknowledged frame is skipped
+and the receiver deduplicates the overlap; a truncated journal or a
+flipped bit in a complete record fails recovery with `ErrChecksum`.
+
 ## Tests
 
     go test ./...
