@@ -381,12 +381,68 @@ func (m *Mux) WriteFrame(f ChannelFrame) error {
 	return nil
 }
 
+// writeFragments atomically journals and enqueues one contiguous run of
+// caller frames on a single channel; it serves the fragmentation layer
+// above, whose messages must enter the queue all at once so their
+// fragments can never interleave with another message of the same
+// channel. The run is accepted only while the channel's in-flight quota
+// is not already exhausted; the run itself may carry the count past the
+// quota by one message at most, and the over-quota tail drains through
+// the same reach-limited Flush logic a restart backlog uses. A rejected
+// run is neither queued nor journaled and consumes no sequence.
+func (m *Mux) writeFragments(frames []ChannelFrame) error {
+	if len(frames) == 0 {
+		return nil
+	}
+	ch := frames[0].Channel
+	if int(ch) >= m.cfg.Channels {
+		return fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
+			ch, m.cfg.Channels, ErrChecksum)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	c := &m.sc[ch]
+	if c.closed {
+		return ErrChannelClosed
+	}
+	if c.next-c.acked >= uint32(m.cfg.Window) {
+		return ErrWindowFull
+	}
+	for _, f := range frames {
+		if len(f.Payload) > MuxMaxPayload {
+			return ErrTooLarge
+		}
+		qf := queuedFrame{
+			channel: ch,
+			seq:     c.next,
+			flags:   f.Flags,
+			kind:    f.Kind,
+			payload: append([]byte(nil), f.Payload...),
+		}
+		if err := m.log.append(qf); err != nil {
+			return err
+		}
+		c.open = true
+		c.next++
+		m.queue = append(m.queue, &qf)
+	}
+	return nil
+}
+
 // CloseChannel closes the write side of ch. The FIN is itself a framed
 // sequence entry: it consumes one in-flight slot, so a full quota makes
 // CloseChannel return ErrWindowFull and the caller retries after acks
 // arrive. Closing a channel that was never written opens it first, so an
 // unused channel still delivers a clean io.EOF to the peer. Closing (or
 // writing to) an already closed channel returns ErrChannelClosed.
+//
+// If the durable close marker cannot be written, the marker's error is
+// returned but the close still takes effect: the FIN is already
+// journaled, so the in-memory state and the journal stay consistent and
+// a later restart recovers the same closed channel instead of rejecting
+// the journal for a duplicated sequence.
 func (m *Mux) CloseChannel(ch uint16) error {
 	if int(ch) >= m.cfg.Channels {
 		return fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
@@ -412,15 +468,16 @@ func (m *Mux) CloseChannel(ch uint16) error {
 	// that contained it is discarded, this file is the only surviving
 	// proof that the channel must never reopen. Written after the FIN
 	// record, so a crash between the two leaves the FIN in the journal
-	// to make the channel closed on recovery instead.
-	if err := markMuxChannelClosed(m.cfg.StateDir, ch); err != nil {
-		return err
-	}
+	// to make the channel closed on recovery instead. Whether or not the
+	// marker lands, the FIN is journaled: the in-memory state must match
+	// the journal, otherwise a retried close would journal a second FIN
+	// at the same sequence and recovery would reject the journal.
+	markerErr := markMuxChannelClosed(m.cfg.StateDir, ch)
 	c.open = true
 	c.closed = true
 	c.next++
 	m.queue = append(m.queue, &qf)
-	return nil
+	return markerErr
 }
 
 // Flush sends every queued frame with transmission opportunities handed

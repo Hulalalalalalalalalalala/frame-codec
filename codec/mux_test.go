@@ -1295,3 +1295,96 @@ func TestMuxNewConfigValidation(t *testing.T) {
 		t.Fatal("empty state dir: want error")
 	}
 }
+
+func TestMuxCloseMarkerFailureKeepsStateConsistent(t *testing.T) {
+	// A close marker that cannot be written still leaves the journal and
+	// the in-memory state consistent: the channel is closed, a retried
+	// close does not journal a second FIN, and recovery is not rejected.
+	dir := t.TempDir()
+	cfg := MuxConfig{Channels: 1, Window: 4, StateDir: dir}
+	relCfg := ReliableConfig{Window: 16, StateDir: filepath.Join(dir, "rel")}
+
+	var wb bytes.Buffer
+	rel1, err := NewReliable(NewSession(&wb, closedReader{}), relCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, err := NewMux(rel1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	// A directory at the marker path makes the marker write fail.
+	if err := os.Mkdir(muxClosePath(dir, 0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.CloseChannel(0); err == nil {
+		t.Fatal("close with unwritable marker: want the marker error")
+	}
+	// The journaled FIN is matched by the in-memory state: the channel
+	// is closed, and a retried close returns the established value
+	// instead of journaling a duplicate FIN.
+	if err := s1.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("y")}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("write after failed marker err = %v, want ErrChannelClosed", err)
+	}
+	if err := s1.CloseChannel(0); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("reclose after failed marker err = %v, want ErrChannelClosed", err)
+	}
+	s1.Close()
+	rel1.Close()
+
+	var wire2 bytes.Buffer
+	rel2, err := NewReliable(NewSession(&wire2, closedReader{}), relCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewMux(rel2, cfg)
+	if err != nil {
+		t.Fatalf("restart after failed marker rejected: %v", err)
+	}
+	if !s2.sc[0].closed {
+		t.Fatal("channel not closed after restart")
+	}
+	if err := s2.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("late")}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("write after restart err = %v, want ErrChannelClosed", err)
+	}
+	if err := s2.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(muxChansSeq(parseMuxWire(t, wire2.Bytes(), 0))); got != "[0:0 0:1F]" {
+		t.Fatalf("wire = %s, want data then FIN", got)
+	}
+}
+
+func TestMuxConcurrentCloseChannel(t *testing.T) {
+	cfg := muxCfg(t, 1, 16)
+	var wire bytes.Buffer
+	snd := newMuxSender(t, &wire, cfg)
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = snd.CloseChannel(0)
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for _, err := range errs {
+		if err == nil {
+			ok++
+			continue
+		}
+		if !errors.Is(err, ErrChannelClosed) {
+			t.Fatalf("concurrent close err = %v, want ErrChannelClosed", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("%d closes succeeded, want exactly 1", ok)
+	}
+}

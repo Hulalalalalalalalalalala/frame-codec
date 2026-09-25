@@ -171,7 +171,73 @@ close marker (`muxNNN.closed`) survives a FIN whose journal prefix was
 discarded. Recovery resumes each channel at the earlier of the
 checkpoint and journal positions, so no unacknowledged frame is skipped
 and the receiver deduplicates the overlap; a truncated journal or a
-flipped bit in a complete record fails recovery with `ErrChecksum`.
+flipped bit in a complete record fails recovery with `ErrChecksum`. If
+the close marker cannot be written, the close still takes effect: the
+FIN is already journaled, so the in-memory state and the journal stay
+consistent and a later restart recovers the same closed channel.
+
+## Fragmentation and reassembly
+
+`codec.NewFrag(m *Mux, cfg FragConfig) (*FragSession, error)` carries
+whole payloads larger than the single-frame limit over one multiplexed
+session: the caller writes each complete payload once and this layer
+cuts it into ordered fragments that ride ordinary mux frames, so the
+mux header, the reliable envelope, the codec frame, the header
+constants and all established error values keep their exact semantics.
+The fragment header lives only inside the mux payload
+(`msg uint32`, `idx uint32`, `total uint32`, `flags uint8`,
+`ack uint32`, `crc32`); no new error values are introduced.
+
+- `FragConfig{MaxMessage int; StateDir string}`: the per-channel
+  reassembly cap in bytes (no message may declare more) and a directory
+  for the per-channel reassembly state files, created if missing.
+- `FragFrame{Channel uint16; Flags uint16; Kind uint8; Payload []byte}`
+  is the caller-visible message. `FragHeaderSize` (21) bytes are
+  reserved inside the mux payload, so one fragment carries at most
+  `FragMaxPayload = MuxMaxPayload - FragHeaderSize` chunk bytes.
+- `(*FragSession).WriteFrame(FragFrame) error` slices the payload into
+  ordered fragments and queues every fragment of the message
+  atomically, so two messages of one channel never interleave; nothing
+  goes out before `Flush`. A payload larger than `MaxMessage` returns
+  `ErrTooLarge`; a channel whose in-flight quota is already exhausted
+  returns `ErrWindowFull` (the same value as `ErrTooLarge`); both drop
+  the write without consuming a message or frame sequence, so a
+  rejected payload takes no buffer. Writing to a closed channel returns
+  `ErrChannelClosed`; an out-of-range channel returns `ErrChecksum`.
+- `(*FragSession).Flush() error` is the mux flush: fragments go out
+  round-robin across channels, so one channel's fragments may be
+  interleaved with other channels' frames, and a message whose
+  fragments span several windows drains as acknowledgements arrive.
+- `(*FragSession).ReadFrame() (FragFrame, error)` delivers one
+  reassembled message per call, exactly once, with byte content and
+  call order identical to the writes; a message stalled mid-assembly on
+  one channel never blocks another channel's delivery. A fragment whose
+  declared total exceeds the reassembly cap drops its whole message
+  with `ErrTooLarge` and the stream continues. A fragment from an old
+  message generation, one beyond the current receive position, a
+  same-position duplicate with different content, an acknowledgement
+  past the send frontier, an unknown flag, a malformed standalone
+  acknowledgement, or a damaged fragment header is refused with
+  `ErrChecksum` - the bare established value, comparable directly with
+  `==` - and stops delivery stickily at the current position. Mux
+  results (the per-channel `io.EOF` at a channel's FIN, the transport's
+  `io.EOF`, `ErrShortFrame`, outer checksum/version/size and reader
+  errors) pass through unchanged.
+- `(*FragSession).CloseChannel(ch) error` closes the channel's write
+  side through the mux and waits for the acknowledgement pump to wind
+  down before returning; a second close returns `ErrChannelClosed`, and
+  concurrent closes of one channel are safe.
+- `(*FragSession).Close() error` stops the acknowledgement pump and
+  closes the wrapped mux.
+
+Restart uses the same durable rules as the lower layers: the send
+position, the receive position and any partially reassembled message
+are recorded per channel in a checksummed state file (`fragNNN.state`),
+rewritten atomically on every accepted fragment, so an interrupted
+reassembly resumes from the last confirmed position with no payload
+delivered twice or skipped, and retransmitted fragments are
+deduplicated. A state file that is truncated, torn or bit-flipped fails
+recovery with `ErrChecksum`.
 
 ## Tests
 
