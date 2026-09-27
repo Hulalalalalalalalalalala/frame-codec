@@ -50,11 +50,19 @@ import (
 //   - The send side hands transmission opportunities out round-robin
 //     across channels, so one channel sending continuously can never
 //     starve the others.
-//   - Every channel has its own in-flight quota; a write that finds the
-//     quota full returns the established over-limit value ErrWindowFull
-//     and an oversized payload returns ErrTooLarge. A rejected frame is
-//     neither queued nor journaled and consumes no sequence, so it takes
-//     no quota; the total buffer is bounded by Channels*Window frames.
+//   - Every channel has its own adaptive in-flight quota in the range
+//     [1,Window]; the channels never influence one another's quota. The
+//     quota grows when acknowledgements advance the channel's position
+//     and tightens back towards 1 when a confirmed frame had to be
+//     retransmitted. A write that cannot be admitted under the current
+//     quota is not rejected: it parks in arrival order and completes
+//     once acknowledgements free quota, so a legal payload is never
+//     dropped for being in flight.
+//   - Admission is strictly FIFO across all writers (a FIN queues like
+//     any other frame), which keeps cross-channel fairness and the
+//     per-channel ordering intact. The in-flight count of a channel can
+//     never cross its current quota: a quota only tightens down to the
+//     frames already in flight and reaches 1 once they drain.
 //   - A channel opens on its first write and its write side can be
 //     closed independently; its FIN rides the sequence stream like a
 //     data frame. After the peer has received the channel's remaining
@@ -64,8 +72,9 @@ import (
 //     ErrChannelClosed.
 //
 // As on the reliable layer, nothing is transmitted before Flush; after
-// a restart the queue is reloaded from the journal, so Flush is also the
-// retransmit operation.
+// a restart the queue is reloaded from the journal, so Flush is also
+// the retransmit operation. The adaptive quota is recovered with the
+// per-channel state and keeps adjusting from the recovered value.
 const (
 	// MuxHeaderSize is this layer's per-frame overhead:
 	// 2 (chan) + 4 (seq) + 1 (flags) + 4 (ack) + 4 (crc32).
@@ -98,14 +107,15 @@ type MuxConfig struct {
 	// numbered 0..Channels-1. It must be positive.
 	Channels int
 
-	// Window is the per-channel in-flight quota in frames, enforced
-	// independently for every channel (and the receive-side reach used
-	// to place inbound sequences). It must be positive.
+	// Window is the per-channel window width in frames: the fixed receive
+	// reach used to place inbound sequences and the UPPER bound of each
+	// channel's adaptive in-flight quota (the lower bound is 1). It must
+	// be positive.
 	Window int
 
-	// StateDir holds the per-channel checkpoint files and the shared
-	// replay journal used to resume the write side after a restart. It
-	// is created if missing.
+	// StateDir holds the per-channel checkpoint files, the per-channel
+	// adaptive quota files and the shared replay journal used to resume
+	// the write side after a restart. It is created if missing.
 	StateDir string
 }
 
@@ -118,7 +128,7 @@ type ChannelFrame struct {
 	Payload []byte
 }
 
-// queuedFrame is one accepted send-side frame waiting for a
+// queuedFrame is one admitted send-side frame waiting for a
 // transmission opportunity or an acknowledgement.
 type queuedFrame struct {
 	channel uint16
@@ -127,17 +137,35 @@ type queuedFrame struct {
 	kind    uint8
 	payload []byte
 	fin     bool
+	// sent is set once the frame has actually been handed to the wire;
+	// handing it again afterwards sets retried. Observing retried when
+	// the frame is acknowledged tightens the channel's quota.
+	sent    bool
+	retried bool
 }
 
 // sendChannel is one direction of one channel on the send side.
 type sendChannel struct {
 	// next is the next sequence a write gets; acked is the cumulative
-	// "next expected" position confirmed by the peer. In-flight quota is
-	// exactly next-acked because rejected frames consume no sequence.
+	// "next expected" position confirmed by the peer. In-flight quota
+	// accounting is exactly next-acked because rejected frames consume
+	// no sequence.
 	next   uint32
 	acked  uint32
 	open   bool // opened by a first write or close
 	closed bool // write side closed (the FIN may still be queued)
+
+	// quota is the channel's current adaptive in-flight quota in
+	// [1,Window]; inflight (next-acked) is never allowed past it.
+	quota uint32
+
+	// FIFO admission: waiters take tickets in arrival order and only the
+	// ticket at headTicket may claim a slot, so a parked writer can never
+	// overtake an earlier parked writer or FIN. waiters counts tickets
+	// actually parked on the condition (Pressure reports it).
+	headTicket uint64
+	nextTicket uint64
+	waiters    int
 }
 
 // inboundFrame is a parked receive-side frame; fin markers carry no
@@ -153,6 +181,26 @@ type muxSeq struct {
 	seq uint32
 }
 
+// ChannelPressure is one channel's send-side flow-control snapshot.
+type ChannelPressure struct {
+	// Channel is the channel number.
+	Channel uint16
+	// InFlight is the number of admitted, unacknowledged frames.
+	InFlight int
+	// Quota is the channel's current adaptive in-flight quota, in
+	// [1,Window].
+	Quota int
+	// Waiting reports whether at least one write or close is parked
+	// waiting for quota to be released.
+	Waiting bool
+}
+
+// PressureReport is a read-only snapshot of every channel's send-side
+// pressure, channel by channel.
+type PressureReport struct {
+	Channels []ChannelPressure
+}
+
 // Mux is a multiplexing layer wrapping one ReliableSession. Create it
 // with NewMux; the wrapped session must not be used directly while the
 // Mux owns it.
@@ -160,9 +208,13 @@ type Mux struct {
 	rel *ReliableSession
 	cfg MuxConfig
 
-	mu    sync.Mutex
-	queue []*queuedFrame // accepted, unacknowledged frames, arrival order
-	sc    []sendChannel
+	mu   sync.Mutex
+	cond *sync.Cond
+	// closing is set by Close so writers parked on quota unwind instead
+	// of waiting forever.
+	closing bool
+	queue   []*queuedFrame // admitted, unacknowledged frames, arrival order
+	sc      []sendChannel
 	// rr is the round-robin cursor: the channel at which the next Flush
 	// starts handing out opportunities.
 	rr  int
@@ -235,6 +287,7 @@ func NewMux(rel *ReliableSession, cfg MuxConfig) (*Mux, error) {
 		stopCh:  make(chan struct{}),
 		doneCh:  make(chan struct{}),
 	}
+	m.cond = sync.NewCond(&m.mu)
 
 	// Load the strict shared journal first, then reconcile per-channel
 	// positions against the checkpoints.
@@ -317,11 +370,40 @@ func NewMux(rel *ReliableSession, cfg MuxConfig) (*Mux, error) {
 			c.open = true
 			c.closed = true
 		}
+
+		// Recover the adaptive quota and continue adjusting from it. A
+		// channel without a flow file starts fully open; a recovered
+		// value is clamped to [1,Window] and raised to whatever frames
+		// are already in flight, so the in-flight count can never cross
+		// the quota.
+		inflight := c.next - c.acked
+		q, qok, err := loadMuxFlow(cfg.StateDir, uint16(ch))
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !qok:
+			c.quota = uint32(cfg.Window)
+		default:
+			if q < 1 {
+				q = 1
+			}
+			if q > uint32(cfg.Window) {
+				q = uint32(cfg.Window)
+			}
+			if q < inflight {
+				q = inflight
+			}
+			c.quota = q
+		}
 	}
 
 	// The send queue is the journal in arrival order, minus frames
 	// already at/behind their channel's resumed position; it feeds
-	// round-robin Flush and bounds in-flight accounting.
+	// round-robin Flush and bounds in-flight accounting. The first
+	// Flush of an incarnation is each frame's initial transmission; a
+	// later Flush handing the same frame again is the retransmit that
+	// tightens its quota.
 	m.queue = make([]*queuedFrame, 0, len(m.log.recs))
 	for i := range m.log.recs {
 		rec := m.log.recs[i]
@@ -336,15 +418,82 @@ func NewMux(rel *ReliableSession, cfg MuxConfig) (*Mux, error) {
 	return m, nil
 }
 
+// takeTicketsLocked reserves n consecutive positions in ch's FIFO
+// admission queue and returns the first ticket. A closed channel refuses
+// before any ticket is taken. The caller later awaits and claims each
+// ticket in order; n is 1 for an ordinary frame or FIN and equals the
+// fragment count for one fragmented message, so that message's fragments
+// occupy consecutive positions and can never be interleaved by a later
+// write to the same channel. Caller holds mu.
+func (m *Mux) takeTicketsLocked(ch uint16, n int) (uint64, error) {
+	c := &m.sc[ch]
+	if c.closed {
+		return 0, ErrChannelClosed
+	}
+	ticket := c.nextTicket
+	c.nextTicket += uint64(n)
+	return ticket, nil
+}
+
+// awaitSlotLocked parks until ticket reaches the head of ch's FIFO queue
+// and one in-flight slot is free (in-flight < quota). cond.Wait releases
+// mu, so acknowledgements and Flush keep progressing while this waits.
+// A session Close, or a channel whose FIN was admitted while this ticket
+// waited, unwinds the wait with ErrChannelClosed; the ticket is released
+// and the wait behind it are cascaded awake. Caller holds mu.
+func (m *Mux) awaitSlotLocked(ch uint16, ticket uint64) error {
+	for ticket != m.sc[ch].headTicket || m.sc[ch].next-m.sc[ch].acked >= m.sc[ch].quota {
+		// Count only tickets actually parked, so Pressure's Waiting flag
+		// never reports an immediately-admitted write as blocked.
+		m.sc[ch].waiters++
+		m.cond.Wait()
+		m.sc[ch].waiters--
+		if m.closing {
+			return ErrChannelClosed
+		}
+		// This ticket's turn arrived only to find the FIN of a concurrent
+		// close ahead of its claims: refuse it rather than admit into a
+		// closed channel.
+		if m.sc[ch].closed && ticket == m.sc[ch].headTicket {
+			return ErrChannelClosed
+		}
+	}
+	return nil
+}
+
+// releaseTicketsLocked unwinds n consecutive tickets starting at first
+// whose wait (or whose whole run) aborted, advancing the FIFO head past
+// them and cascading the wakeup to the tickets behind. Caller holds mu.
+func (m *Mux) releaseTicketsLocked(ch uint16, first uint64, n int) {
+	c := &m.sc[ch]
+	end := first + uint64(n)
+	if c.headTicket >= first && c.headTicket < end {
+		c.headTicket = end
+	}
+	m.cond.Broadcast()
+}
+
+// claimSlotLocked releases the FIFO turn of one claimed ticket and wakes
+// the next waiter. It is called once per ticket after a successful
+// awaitSlotLocked, whether the journal append then committed or failed:
+// a failed append never consumes a sequence, so its turn must move on.
+// Caller holds mu.
+func (m *Mux) claimSlotLocked(ch uint16, ticket uint64) {
+	m.releaseTicketsLocked(ch, ticket, 1)
+}
+
 // WriteFrame enqueues f on channel f.Channel and assigns it that
 // channel's next sequence; nothing reaches the wire before Flush.
 //
-// It returns ErrTooLarge for a payload larger than MuxMaxPayload, the
-// established checksum value for a channel number outside the session,
-// ErrWindowFull when the channel already holds Window unacknowledged
-// frames, and ErrChannelClosed when the channel's write side has been
-// closed. A rejected frame is neither queued nor journaled and consumes
-// no sequence.
+// It returns ErrTooLarge for a payload larger than MuxMaxPayload and the
+// established checksum value for a channel number outside the session.
+// When the channel's in-flight count already reaches its adaptive quota,
+// WriteFrame does not reject the frame: it parks in arrival order behind
+// the channel's earlier writes (and its FIN) and completes once
+// acknowledgements release quota, so a legal payload is never dropped and
+// every admitted frame keeps its arrival-determined sequence. A journal
+// write failure returns the underlying I/O error without consuming a
+// sequence or a quota slot.
 func (m *Mux) WriteFrame(f ChannelFrame) error {
 	if len(f.Payload) > MuxMaxPayload {
 		return ErrTooLarge
@@ -357,14 +506,16 @@ func (m *Mux) WriteFrame(f ChannelFrame) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	c := &m.sc[f.Channel]
-	if c.closed {
-		return ErrChannelClosed
+	ticket, err := m.takeTicketsLocked(f.Channel, 1)
+	if err != nil {
+		return err
 	}
-	if c.next-c.acked >= uint32(m.cfg.Window) {
-		return ErrWindowFull
+	if err := m.awaitSlotLocked(f.Channel, ticket); err != nil {
+		m.releaseTicketsLocked(f.Channel, ticket, 1)
+		return err
 	}
 
+	c := &m.sc[f.Channel]
 	qf := queuedFrame{
 		channel: f.Channel,
 		seq:     c.next,
@@ -373,47 +524,118 @@ func (m *Mux) WriteFrame(f ChannelFrame) error {
 		payload: append([]byte(nil), f.Payload...),
 	}
 	if err := m.log.append(qf); err != nil {
+		m.claimSlotLocked(f.Channel, ticket)
 		return err
 	}
 	c.open = true
 	c.next++
 	m.queue = append(m.queue, &qf)
+	m.claimSlotLocked(f.Channel, ticket)
 	return nil
 }
 
-// writeFragments atomically journals and enqueues one contiguous run of
-// caller frames on a single channel; it serves the fragmentation layer
-// above, whose messages must enter the queue all at once so their
-// fragments can never interleave with another message of the same
-// channel. The run is accepted only while the channel's in-flight quota
-// is not already exhausted; the run itself may carry the count past the
-// quota by one message at most, and the over-quota tail drains through
-// the same reach-limited Flush logic a restart backlog uses. A rejected
-// run is neither queued nor journaled and consumes no sequence.
-func (m *Mux) writeFragments(frames []ChannelFrame) error {
-	if len(frames) == 0 {
-		return nil
+// tryWriteFrame attempts to enqueue f without ever parking: it admits
+// only when the channel has no outstanding FIFO tickets and a quota slot
+// is free right now. It returns admitted=false when the frame would have
+// to wait (the standalone-ack pump uses this to stay best-effort, like
+// skipping ErrWindowFull before admission blocked). Validation errors
+// (oversize/out-of-range/closed) are returned directly; a skipped frame
+// consumes nothing.
+func (m *Mux) tryWriteFrame(f ChannelFrame) (admitted bool, err error) {
+	if len(f.Payload) > MuxMaxPayload {
+		return false, ErrTooLarge
 	}
-	ch := frames[0].Channel
-	if int(ch) >= m.cfg.Channels {
-		return fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
-			ch, m.cfg.Channels, ErrChecksum)
+	if int(f.Channel) >= m.cfg.Channels {
+		return false, fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
+			f.Channel, m.cfg.Channels, ErrChecksum)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	c := &m.sc[ch]
+	c := &m.sc[f.Channel]
 	if c.closed {
-		return ErrChannelClosed
+		return false, ErrChannelClosed
 	}
-	if c.next-c.acked >= uint32(m.cfg.Window) {
-		return ErrWindowFull
+	if c.nextTicket != c.headTicket || c.next-c.acked >= c.quota {
+		return false, nil
+	}
+	ticket, err := m.takeTicketsLocked(f.Channel, 1)
+	if err != nil {
+		return false, err
+	}
+	qf := queuedFrame{
+		channel: f.Channel,
+		seq:     c.next,
+		flags:   f.Flags,
+		kind:    f.Kind,
+		payload: append([]byte(nil), f.Payload...),
+	}
+	if err := m.log.append(qf); err != nil {
+		m.claimSlotLocked(f.Channel, ticket)
+		return false, err
+	}
+	c.open = true
+	c.next++
+	m.queue = append(m.queue, &qf)
+	m.claimSlotLocked(f.Channel, ticket)
+	return true, nil
+}
+
+// prepareRun validates one channel's frames and reserves their
+// consecutive FIFO admission tickets WITHOUT blocking on quota. It lets
+// a caller reserve run ordering under its own (upper-layer) lock and
+// release that lock before the blocking commit, so inbound
+// acknowledgements can still be processed while the run waits.
+func (m *Mux) prepareRun(frames []ChannelFrame) (ch uint16, first uint64, err error) {
+	if len(frames) == 0 {
+		return 0, 0, nil
+	}
+	ch = frames[0].Channel
+	if int(ch) >= m.cfg.Channels {
+		return 0, 0, fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
+			ch, m.cfg.Channels, ErrChecksum)
 	}
 	for _, f := range frames {
-		if len(f.Payload) > MuxMaxPayload {
-			return ErrTooLarge
+		if f.Channel != ch {
+			return 0, 0, fmt.Errorf("codec: mux run mixes channels %d and %d: %w",
+				ch, f.Channel, ErrChecksum)
 		}
+		if len(f.Payload) > MuxMaxPayload {
+			return 0, 0, ErrTooLarge
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	first, err = m.takeTicketsLocked(ch, len(frames))
+	if err != nil {
+		return 0, 0, err
+	}
+	return ch, first, nil
+}
+
+// commitRun drives a run previously reserved with prepareRun to its
+// blocking admission, fragment by fragment. It takes only the mux lock
+// (released while parked), so an upper layer must NOT hold its own lock
+// across this call: inbound acks must keep flowing while the run waits
+// for quota.
+func (m *Mux) commitRun(frames []ChannelFrame, ch uint16, ticket uint64) error {
+	if len(frames) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for k, f := range frames {
+		t := ticket + uint64(k)
+		if err := m.awaitSlotLocked(ch, t); err != nil {
+			// Unwind this fragment's ticket and every later ticket of the
+			// run in one cascade; already-claimed fragments keep theirs.
+			m.releaseTicketsLocked(ch, t, len(frames)-k)
+			return err
+		}
+		c := &m.sc[ch]
 		qf := queuedFrame{
 			channel: ch,
 			seq:     c.next,
@@ -422,19 +644,21 @@ func (m *Mux) writeFragments(frames []ChannelFrame) error {
 			payload: append([]byte(nil), f.Payload...),
 		}
 		if err := m.log.append(qf); err != nil {
+			m.releaseTicketsLocked(ch, t, len(frames)-k)
 			return err
 		}
 		c.open = true
 		c.next++
 		m.queue = append(m.queue, &qf)
+		m.claimSlotLocked(ch, t)
 	}
 	return nil
 }
 
 // CloseChannel closes the write side of ch. The FIN is itself a framed
-// sequence entry: it consumes one in-flight slot, so a full quota makes
-// CloseChannel return ErrWindowFull and the caller retries after acks
-// arrive. Closing a channel that was never written opens it first, so an
+// sequence entry: it consumes one in-flight slot, so CloseChannel parks
+// behind the channel's earlier writes and completes once a quota slot is
+// free. Closing a channel that was never written opens it first, so an
 // unused channel still delivers a clean io.EOF to the peer. Closing (or
 // writing to) an already closed channel returns ErrChannelClosed.
 //
@@ -452,16 +676,19 @@ func (m *Mux) CloseChannel(ch uint16) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	c := &m.sc[ch]
-	if c.closed {
-		return ErrChannelClosed
+	ticket, err := m.takeTicketsLocked(ch, 1)
+	if err != nil {
+		return err
 	}
-	if c.next-c.acked >= uint32(m.cfg.Window) {
-		return ErrWindowFull
+	if err := m.awaitSlotLocked(ch, ticket); err != nil {
+		m.releaseTicketsLocked(ch, ticket, 1)
+		return err
 	}
 
+	c := &m.sc[ch]
 	qf := queuedFrame{channel: ch, seq: c.next, fin: true}
 	if err := m.log.append(qf); err != nil {
+		m.claimSlotLocked(ch, ticket)
 		return err
 	}
 	// Durable close marker: once a FIN is acked and the journal prefix
@@ -477,6 +704,7 @@ func (m *Mux) CloseChannel(ch uint16) error {
 	c.closed = true
 	c.next++
 	m.queue = append(m.queue, &qf)
+	m.claimSlotLocked(ch, ticket)
 	return markerErr
 }
 
@@ -487,6 +715,13 @@ func (m *Mux) CloseChannel(ch uint16) error {
 // never overtake an earlier frame of their own channel. Every data
 // frame piggybacks the sender's current receive position for its
 // channel; standalone acks for every channel follow the run.
+//
+// Per-channel reach is that channel's CURRENT adaptive quota (never more
+// than the configured window width), so frames parked under a tightened
+// quota simply wait for the next acknowledgement instead of overflowing
+// the peer. A frame handed to the wire on a later Flush than the first
+// one that sent it is recorded as a retransmit; seeing that record when
+// the frame is acknowledged is what tightens the channel's quota.
 //
 // After a restart the queue was reloaded from the journal, so Flush is
 // also the retransmit operation; the receiver deduplicates overlaps.
@@ -509,18 +744,33 @@ func (m *Mux) Flush() error {
 	// there, flush the accepted prefix and leave every unhanded frame
 	// queued for the next Flush; the receiver deduplicates the overlap.
 	lastServed := -1
+	handed := make([]*queuedFrame, 0, len(out))
 	for i := range out {
-		err := m.rel.WriteFrame(out[i])
+		err := m.rel.WriteFrame(out[i].rf)
 		if errors.Is(err, ErrWindowFull) {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		// out is one data frame per queued entry; recover its channel
-		// from its mux header rather than re-planning.
-		lastServed = int(binary.BigEndian.Uint16(out[i].Payload[mhChanOff:mhSeqOff]))
+		handed = append(handed, out[i].qf)
+		lastServed = int(out[i].qf.channel)
 	}
+	// Record transmission history while holding the lock: a frame handed
+	// to the wire a second time (a Flush retransmit after an earlier
+	// Flush already sent it, or a restart backlog re-sent once more) is a
+	// retransmit and tightens its channel's quota when it is later
+	// acknowledged. Frames the reliable window refused stay unrecorded
+	// for this Flush. Marking happens before rel.Flush so a peer ack
+	// arriving on another goroutine always observes the history first.
+	m.mu.Lock()
+	for _, qf := range handed {
+		if qf.sent {
+			qf.retried = true
+		}
+		qf.sent = true
+	}
+	m.mu.Unlock()
 	if err := m.rel.Flush(); err != nil {
 		return err
 	}
@@ -536,52 +786,69 @@ func (m *Mux) Flush() error {
 	return nil
 }
 
-// buildFlushLocked returns the data frames of one Flush in wire order.
-// It never mutates the queue or the round-robin cursor. The caller
-// holds mu.
-func (m *Mux) buildFlushLocked(acks []uint32) []ReliableFrame {
-	// Entries of one channel are always in ascending seq order (append
-	// order at write time, journal order after a restart); pending just
-	// tracks which have been taken during this Flush.
-	pending := make([]*queuedFrame, len(m.queue))
-	copy(pending, m.queue)
+// plannedFrame pairs one queued frame with the reliable frame built for
+// the current Flush, so the sender can mark exactly the frames handed to
+// wire.
+type plannedFrame struct {
+	qf *queuedFrame
+	rf ReliableFrame
+}
 
-	out := make([]ReliableFrame, 0, len(pending))
+// buildFlushLocked returns the data frames of one Flush in wire order.
+// It never mutates the queue, the quotas or the round-robin cursor. The
+// caller holds mu.
+func (m *Mux) buildFlushLocked(acks []uint32) []plannedFrame {
+	out := make([]plannedFrame, 0, len(m.queue))
+	// lastSeq remembers, per channel, the sequence already selected in an
+	// earlier pass of this Flush: the queue is never mutated here, so the
+	// next per-channel pick must be strictly past it.
+	lastSeq := make([]uint32, m.cfg.Channels)
+	haveSeq := make([]bool, m.cfg.Channels)
 	cursor := m.rr
-	for len(pending) > 0 {
+	for {
 		startCh := cursor
 		taken := false
 		for step := 0; step < m.cfg.Channels; step++ {
 			ch := uint16((startCh + step) % m.cfg.Channels)
-			// The peer accepts exactly this channel's next Window
+			// The peer accepts exactly this channel's next quota many
 			// sequences; frames past the reach wait for an ack, so a
-			// restart backlog wider than one window drains gradually
-			// instead of being refused as "too far ahead".
-			reach := m.sc[ch].acked + uint32(m.cfg.Window)
-			idx := -1
-			for i, qf := range pending {
-				if qf.channel != ch {
+			// restart backlog, or a queue parked under a tightened quota,
+			// drains gradually instead of being refused as "too far
+			// ahead". Per-channel queue entries are ascending, so the
+			// first in-reach entry past the last picked one is the one to
+			// send.
+			c := &m.sc[ch]
+			reach := c.acked + c.quota
+			var qf *queuedFrame
+			for _, q := range m.queue {
+				if q.channel != ch {
 					continue
 				}
-				if qf.seq >= reach {
-					break // per-channel entries are ascending
+				if haveSeq[ch] && q.seq <= lastSeq[ch] {
+					continue // already handed out in an earlier pass
 				}
-				idx = i
+				if q.seq >= reach {
+					break
+				}
+				qf = q
 				break
 			}
-			if idx < 0 {
+			if qf == nil {
 				continue
 			}
-			qf := pending[idx]
-			pending = append(pending[:idx], pending[idx+1:]...)
+			lastSeq[ch] = qf.seq
+			haveSeq[ch] = true
 			flag := uint8(0)
 			if qf.fin {
 				flag = mhFlagFin
 			}
-			out = append(out, ReliableFrame{
-				Flags:   qf.flags,
-				Kind:    qf.kind,
-				Payload: encodeMuxHeader(qf.channel, qf.seq, flag, acks[qf.channel], qf.payload),
+			out = append(out, plannedFrame{
+				qf: qf,
+				rf: ReliableFrame{
+					Flags:   qf.flags,
+					Kind:    qf.kind,
+					Payload: encodeMuxHeader(qf.channel, qf.seq, flag, acks[qf.channel], qf.payload),
+				},
 			})
 			taken = true
 			cursor = int(ch) + 1 // next pass starts after the served channel
@@ -784,8 +1051,8 @@ func sameInbound(a, b inboundFrame) bool {
 
 // nextDeliverableLocked finds the lowest-numbered channel whose due
 // sequence is parked (a FIN-closed channel is skipped), records the
-// delivery and asks for an acknowledgement. It returns eof=true when
-// the delivered entry is the channel's FIN: the caller then returns
+// delivery and asks for an acknowledgement. It returns eof=true when the
+// delivered entry is the channel's FIN: the caller then returns
 // (ChannelFrame{Channel: ch}, io.EOF). Caller holds rmu.
 func (m *Mux) nextDeliverableLocked() (cf ChannelFrame, eof bool, ok bool) {
 	for ch := 0; ch < m.cfg.Channels; ch++ {
@@ -819,9 +1086,10 @@ func (m *Mux) nextDeliverableLocked() (cf ChannelFrame, eof bool, ok bool) {
 }
 
 // applyAck advances one channel's cumulative send position, releases
-// the freed quota slots and discards the journal prefix once the new
-// position is durable. Positions that do not move the channel forward
-// are ignored. The caller holds rmu (rmu-then-mu order).
+// the freed quota slots, adjusts the channel's adaptive quota and
+// discards the journal prefix once the new position is durable.
+// Positions that do not move the channel forward are ignored. The
+// caller holds rmu (rmu-then-mu order).
 func (m *Mux) applyAck(ch uint16, ack uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -830,10 +1098,15 @@ func (m *Mux) applyAck(ch uint16, ack uint32) {
 	if ack <= c.acked || ack > c.next {
 		return
 	}
+	advanced := ack - c.acked
 
+	sawRetransmit := false
 	kept := m.queue[:0]
 	for _, qf := range m.queue {
 		if qf.channel == ch && qf.seq < ack {
+			if qf.retried {
+				sawRetransmit = true
+			}
 			continue
 		}
 		kept = append(kept, qf)
@@ -841,12 +1114,67 @@ func (m *Mux) applyAck(ch uint16, ack uint32) {
 	m.queue = kept
 	c.acked = ack
 
+	// Adaptive rule, per channel and independent of every other
+	// channel:
+	//   - timely acks widen the quota by how far the position advanced,
+	//     up to the configured window width (and never below the frames
+	//     already in flight);
+	//   - a retransmitted frame among those just confirmed means the path
+	//     needed repair: tighten to exactly the frames still in flight,
+	//     reaching the floor of 1 once they drain.
+	// The in-flight count can therefore never cross the resulting quota.
+	inflight := c.next - c.acked
+	width := uint32(m.cfg.Window)
+	if sawRetransmit {
+		c.quota = inflight
+		if c.quota < 1 {
+			c.quota = 1
+		}
+	} else {
+		q := c.quota + advanced
+		if q < inflight {
+			q = inflight
+		}
+		if q > width {
+			q = width
+		}
+		c.quota = q
+	}
+	// The recovered/adjusted quota joins the per-channel durable state;
+	// a failed write only costs the adjustment since the last checkpoint.
+	_ = saveMuxFlow(m.cfg.StateDir, ch, c.quota)
+
 	// Durable per-channel position BEFORE the journal prefix is
 	// discarded: a crash between the two only leaves extra frames to
 	// dedupe, never a gap.
 	if err := saveMuxCheckpoint(m.cfg.StateDir, ch, ack); err == nil && m.log != nil {
 		_ = m.log.prefix(m.sc)
 	}
+
+	// Released slots and a possibly grown quota unblock exactly the FIFO
+	// waiters that can now admit.
+	m.cond.Broadcast()
+}
+
+// Pressure returns a read-only snapshot of every channel's send-side
+// pressure: the admitted in-flight frame count, the current adaptive
+// quota and whether a write or close is parked waiting for quota. It
+// never blocks admission or transmission.
+func (m *Mux) Pressure() PressureReport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rep := PressureReport{Channels: make([]ChannelPressure, m.cfg.Channels)}
+	for ch := 0; ch < m.cfg.Channels; ch++ {
+		c := &m.sc[ch]
+		rep.Channels[ch] = ChannelPressure{
+			Channel:  uint16(ch),
+			InFlight: int(c.next - c.acked),
+			Quota:    int(c.quota),
+			Waiting:  c.waiters > 0,
+		}
+	}
+	return rep
 }
 
 // signalAckLocked coalescingly asks the background sender to restate
@@ -906,11 +1234,17 @@ func (m *Mux) failReadLocked(err error) (ChannelFrame, error) {
 	return ChannelFrame{}, err
 }
 
-// Close stops the background acknowledgement sender. Fully journaled
-// but unacknowledged frames remain in the mux journal for a later
-// restart to resend.
+// Close stops the background acknowledgement sender and wakes every
+// writer parked on quota. Fully journaled but unacknowledged frames
+// remain in the mux journal for a later restart to resend.
 func (m *Mux) Close() error {
-	m.closeOnce.Do(func() { close(m.stopCh) })
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
+		m.mu.Lock()
+		m.closing = true
+		m.cond.Broadcast()
+		m.mu.Unlock()
+	})
 	return nil
 }
 
@@ -957,17 +1291,22 @@ func decodeMuxHeader(p []byte) (ch uint16, seq uint32, flags uint8, ack uint32, 
 }
 
 // ----------------------------------------------------------------------
-// Durable state: one dual-slot, checksummed checkpoint file per channel
-// and one strict CRC'd replay journal shared by all channels.
+// Durable state: one dual-slot, checksummed checkpoint file per channel,
+// one strict CRC'd adaptive-quota file per channel and one strict CRC'd
+// replay journal shared by all channels.
 // ----------------------------------------------------------------------
 
 const (
 	muxCheckpointPrefix = "mux"
 	muxCheckpointSuffix = ".ckp"
+	muxFlowSuffix       = ".flow"
 	muxJournalName      = "mux.log"
 
 	muxCPRecordSize = 4 + 4 + 4 // generation + ack + crc32
 	muxCPSlotSize   = 2 * muxCPRecordSize
+
+	// quota(4) + crc32(4).
+	muxFlowSize = 8
 
 	// ch(2) + seq(4) + fin(1) + flags(2) + kind(1) + len(4) + crc(4).
 	muxLogHdrSize = 18
@@ -1004,6 +1343,59 @@ type muxLog struct {
 
 func muxCheckpointPath(dir string, ch uint16) string {
 	return filepath.Join(dir, fmt.Sprintf("%s%03d%s", muxCheckpointPrefix, ch, muxCheckpointSuffix))
+}
+
+// muxFlowPath names a channel's durable adaptive-quota file.
+func muxFlowPath(dir string, ch uint16) string {
+	return filepath.Join(dir, fmt.Sprintf("%s%03d%s", muxCheckpointPrefix, ch, muxFlowSuffix))
+}
+
+// loadMuxFlow reads one channel's durable adaptive quota. A missing
+// file means "never adjusted" (the caller picks the default). A
+// truncated or bit-flipped file fails recovery with ErrChecksum rather
+// than resuming the quota from an unverified value.
+func loadMuxFlow(dir string, ch uint16) (uint32, bool, error) {
+	data, err := os.ReadFile(muxFlowPath(dir, ch))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if len(data) != muxFlowSize ||
+		crc32.ChecksumIEEE(data[:4]) != binary.BigEndian.Uint32(data[4:8]) {
+		return 0, false, fmt.Errorf("codec: mux flow state ch %d corrupted: %w", ch, ErrChecksum)
+	}
+	q := binary.BigEndian.Uint32(data[0:4])
+	if q == 0 {
+		return 0, false, fmt.Errorf("codec: mux flow state ch %d carries zero quota: %w", ch, ErrChecksum)
+	}
+	return q, true, nil
+}
+
+// saveMuxFlow writes one channel's adjusted quota atomically.
+func saveMuxFlow(dir string, ch uint16, quota uint32) error {
+	path := muxFlowPath(dir, ch)
+	rec := make([]byte, muxFlowSize)
+	binary.BigEndian.PutUint32(rec[0:4], quota)
+	binary.BigEndian.PutUint32(rec[4:8], crc32.ChecksumIEEE(rec[0:4]))
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(rec); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // muxCloseSuffix names a channel's durable write-side close marker; the

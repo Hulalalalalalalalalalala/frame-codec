@@ -268,7 +268,7 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := NewMux(rel, MuxConfig{Channels: 2, Window: 2, StateDir: filepath.Join(dir, sub)})
+		m, err := NewMux(rel, MuxConfig{Channels: 2, Window: 8, StateDir: filepath.Join(dir, sub)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -345,60 +345,28 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 		}
 	}()
 
-	// The big message is accepted in one call even though its fragments
-	// span several windows.
+	// The big message is admitted fragment by fragment even though more
+	// fragments are queued than one window drains at a time: its run
+	// parks as needed and completes as the peer's acks release quota.
 	if err := fa.WriteFrame(FragFrame{Channel: 0, Kind: 7, Payload: big}); err != nil {
 		t.Fatalf("big write: %v", err)
 	}
-	waitQuota := func(step string) {
-		t.Helper()
-		for {
-			select {
-			case res := <-resCh:
-				t.Fatalf("collector exited during %s: err=%v big=%d smalls=%d eofs=%v",
-					step, res.err, len(res.big), len(res.smalls), res.eofs)
-			case <-time.After(10 * time.Second):
-				t.Fatalf("timed out during %s", step)
-			default:
-			}
-			var err error
-			switch step {
-			case "close0":
-				err = fa.CloseChannel(0)
-			case "close1":
-				err = fa.CloseChannel(1)
-			}
-			if err == nil {
-				return
-			}
-			if !errors.Is(err, ErrWindowFull) {
-				t.Fatalf("%s: %v", step, err)
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}
 	for i := 0; i < smalls; i++ {
+		// A blocked write simply waits for quota (acks flow through the
+		// dedicated reader and the flush pump) and then completes.
 		payload := []byte(fmt.Sprintf("s%02d", i))
-		for {
-			select {
-			case res := <-resCh:
-				t.Fatalf("collector exited during small %d: err=%v", i, res.err)
-			case <-time.After(10 * time.Second):
-				t.Fatalf("timed out during small %d", i)
-			default:
-			}
-			err := fa.WriteFrame(FragFrame{Channel: 1, Kind: uint8(i), Payload: payload})
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, ErrWindowFull) {
-				t.Fatalf("small write %d: %v", i, err)
-			}
-			time.Sleep(time.Millisecond)
+		if err := fa.WriteFrame(FragFrame{Channel: 1, Kind: uint8(i), Payload: payload}); err != nil {
+			t.Fatalf("small write %d: %v", i, err)
 		}
 	}
-	waitQuota("close0")
-	waitQuota("close1")
+	// Closes park behind any queued frames and complete once their FIN
+	// slot is free.
+	if err := fa.CloseChannel(0); err != nil {
+		t.Fatalf("close0: %v", err)
+	}
+	if err := fa.CloseChannel(1); err != nil {
+		t.Fatalf("close1: %v", err)
+	}
 
 	res := <-resCh
 	a.Close()
@@ -449,26 +417,39 @@ func TestFragOverCapWriteRejected(t *testing.T) {
 	}
 }
 
-func TestFragQuotaFullRejected(t *testing.T) {
+func TestFragQuotaFullParksFragmentWiseAndReleases(t *testing.T) {
 	const W = 2
 	cfg := muxCfg(t, 1, W)
 	var wire bytes.Buffer
 	snd := newFragSender(t, &wire, cfg, 1<<20)
 
-	// Two fragments fill the per-channel quota exactly.
+	// Two fragments fill the per-channel quota exactly. The next message
+	// is not rejected: it parks fragment by fragment and completes once
+	// acknowledgements release quota, keeping arrival order.
 	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: fragPattern(FragMaxPayload + 1)}); err != nil {
 		t.Fatal(err)
 	}
-	err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("drop")})
-	if err != ErrWindowFull || err != ErrTooLarge {
-		t.Fatalf("quota err = %v, want ErrWindowFull == ErrTooLarge", err)
+	parked := make(chan error, 1)
+	go func() {
+		parked <- snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("keep")})
+	}()
+	waitMuxWaiting(t, snd.mux, 0, true)
+	if pc := snd.Pressure().Channels[0]; pc.InFlight != W || pc.Quota != W || !pc.Waiting {
+		t.Fatalf("pressure = %+v, want in-flight %d quota %d waiting", pc, W, W)
 	}
-	// Acks free the quota; the retried write takes the next message
-	// sequence, proving the rejected one consumed none.
+
+	// One ack frees one slot: the parked single-fragment message is
+	// admitted, taking the next message sequence (no sequence was
+	// consumed while it waited).
 	snd.mux.applyAck(0, 2)
 	snd.mux.rel.applyAck(2)
-	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("keep")}); err != nil {
-		t.Fatalf("write after ack: %v", err)
+	select {
+	case err := <-parked:
+		if err != nil {
+			t.Fatalf("parked write after ack: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked write did not complete after acks")
 	}
 	if err := snd.Flush(); err != nil {
 		t.Fatal(err)
@@ -476,6 +457,37 @@ func TestFragQuotaFullRejected(t *testing.T) {
 	ws := parseFragWire(t, wire.Bytes(), 0)
 	if len(ws) != 1 || ws[0].msg != 1 || ws[0].muxSeq != 2 || string(ws[0].chunk) != "keep" {
 		t.Fatalf("wire = %+v, want msg 1 at mux seq 2", ws)
+	}
+}
+
+func TestFragMoreFragmentsThanWindowRejected(t *testing.T) {
+	const W = 2
+	cfg := muxCfg(t, 1, W)
+	var wire bytes.Buffer
+	snd := newFragSender(t, &wire, cfg, 8<<20)
+
+	// A message that needs W+1 fragments can never fit even a fully open
+	// quota: immediate ErrTooLarge, no backpressure wait, no buffer and
+	// no consumed message sequence.
+	tooLarge := fragPattern(W*FragMaxPayload + 1) // W+1 fragments
+	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: tooLarge}); err != ErrTooLarge {
+		t.Fatalf("over-window message err = %v, want ErrTooLarge", err)
+	}
+	// Exactly W fragments is legal and admitted.
+	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: fragPattern(W * FragMaxPayload)}); err != nil {
+		t.Fatalf("exactly-window message: %v", err)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	ws := parseFragWire(t, wire.Bytes(), 0)
+	if len(ws) != W {
+		t.Fatalf("fragments = %d, want %d", len(ws), W)
+	}
+	for i, w := range ws {
+		if w.msg != 0 || w.idx != uint32(i) {
+			t.Fatalf("fragment %d = %+v, want msg 0 idx %d (rejected message consumed no seq)", i, w, i)
+		}
 	}
 }
 
@@ -657,6 +669,39 @@ func TestFragAckRefusals(t *testing.T) {
 	}
 }
 
+// ---- state I/O failure -----------------------------------------------------------
+
+func TestFragStatePersistFailureStopsDelivery(t *testing.T) {
+	cfg := muxCfg(t, 1, 8)
+	f := newFeed()
+	rcv := newFragReceiver(t, f, cfg, 1<<20)
+
+	// A directory at the state file path makes the atomic rename in
+	// saveFragState fail with a raw I/O error (created after NewFrag so
+	// construction still succeeds).
+	statePath := fragStatePath(rcv.cfg.StateDir, 0)
+	if err := os.Mkdir(statePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A complete one-fragment message cannot be checkpointed: the raw
+	// underlying error is returned (not swallowed, not mapped to a
+	// sentinel) and the message is never delivered.
+	f.replace(envWire(t, fragDataEnv(0, 0, 0, 0, 0, 1, fhFlagLast, 0, []byte("z"))))
+	ff, err := rcv.ReadFrame()
+	if err == nil {
+		t.Fatalf("ReadFrame = %+v, want the raw state I/O error", ff)
+	}
+	if errors.Is(err, ErrChecksum) || errors.Is(err, ErrTooLarge) || errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v, want the underlying I/O error, not an established sentinel", err)
+	}
+	// Delivery stops stickily: later calls return the same error and
+	// never emit the uncheckpointed message.
+	if _, err2 := rcv.ReadFrame(); err2 != err {
+		t.Fatalf("second ReadFrame err = %v, want the same sticky error %v", err2, err)
+	}
+}
+
 // ---- restart and recovery -------------------------------------------------------
 
 func TestFragRestartResumesAndContinues(t *testing.T) {
@@ -759,6 +804,14 @@ func TestFragRestartResumesAndContinues(t *testing.T) {
 	if _, err := rcv.ReadFrame(); !errors.Is(err, io.EOF) {
 		t.Fatalf("err = %v, want io.EOF with nothing delivered twice", err)
 	}
+
+	// Stop the background pumps before the temp directory is removed.
+	rcv.Close()
+	rmux.Close()
+	rrel.Close()
+	s2.Close()
+	m2.Close()
+	rel2.Close()
 }
 
 func TestFragRestartPartialMessageResume(t *testing.T) {
@@ -842,7 +895,8 @@ func TestFragRestartPartialMessageResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewFrag(m2, fcfg); err != nil {
+	s2, err := NewFrag(m2, fcfg)
+	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}
 	if err := m2.Flush(); err != nil {
@@ -858,6 +912,16 @@ func TestFragRestartPartialMessageResume(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("message not reassembled after restart")
 	}
+
+	// Stop every background acknowledgement pump before the temp
+	// directory is removed, so no pump writes a late state file into the
+	// directory while cleanup unlinks it.
+	rcv.Close()
+	rmux.Close()
+	rrel.Close()
+	s2.Close()
+	m2.Close()
+	rel2.Close()
 }
 
 func TestFragReceiverStateRecovery(t *testing.T) {
@@ -895,6 +959,7 @@ func TestFragReceiverStateRecovery(t *testing.T) {
 		t.Fatalf("first incarnation err = %v, want io.EOF", err)
 	}
 	r1.Close()
+	rmux1.Close()
 	rrel1.Close()
 
 	// Second incarnation over a fresh connection: the assembly resumes
@@ -927,6 +992,7 @@ func TestFragReceiverStateRecovery(t *testing.T) {
 		t.Fatalf("reassembled %d bytes, content mismatch", len(got.Payload))
 	}
 	r2.Close()
+	rmux2.Close()
 	rrel2.Close()
 }
 

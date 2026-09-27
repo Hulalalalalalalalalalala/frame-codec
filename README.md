@@ -116,29 +116,44 @@ so the reliable envelope, the codec frame, the header constants and
 all established error values keep their exact semantics.
 
 - `MuxConfig{Channels int; Window int; StateDir string}`: the number of
-  channels (numbered `0..Channels-1`), the per-channel in-flight quota
-  in frames (enforced independently), and a write-side state directory
-  (per-channel dual-slot checkpoints, a shared replay journal and
-  per-channel close markers), created if missing.
+  channels (numbered `0..Channels-1`), the fixed per-channel window
+  width (the receive reach and the **upper bound** of each channel's
+  adaptive in-flight quota, whose lower bound is 1), and a write-side
+  state directory (per-channel dual-slot checkpoints, per-channel
+  adaptive-quota files, a shared replay journal and per-channel close
+  markers), created if missing.
 - `ChannelFrame{Channel uint16; Flags uint16; Kind uint8; Payload []byte}`
   is the caller-visible frame. `MuxHeaderSize` (15) bytes are reserved
   inside the reliable payload, so the inner payload limit is
   `MuxMaxPayload = ReliableMaxPayload - MuxHeaderSize`.
+- **Adaptive flow control and backpressure.** Each channel carries an
+  in-flight quota that adjusts independently in `[1, Window]`: timely
+  cumulative acknowledgements widen it (up to `Window`), while a frame
+  that had to be retransmitted tightens it back towards `1`. The
+  adjustment never changes the cross-channel round-robin fairness or
+  the per-channel frame ordering, and one channel's quota never affects
+  another's.
 - `(*Mux).WriteFrame(ChannelFrame) error` numbers frames per channel in
-  write order, journals each one and parks it in the channel's quota;
-  nothing goes out before `Flush`. A full per-channel quota returns the
-  established over-limit sentinel `ErrWindowFull` (the same value as
-  `ErrTooLarge`); an oversized payload returns `ErrTooLarge`. A rejected
-  frame is neither queued nor journaled and consumes no sequence, so it
-  takes no quota; total buffering is bounded by `Channels*Window`.
-  Writing to a closed channel returns the new sentinel
+  write order, journals each one and counts it against the channel's
+  current in-flight quota; nothing goes out before `Flush`. A legal
+  payload is never rejected for being in flight: when the quota is
+  exhausted the call **parks in arrival order** and completes once
+  acknowledgements release a slot, so the admitted in-flight count can
+  never cross the current quota. An oversized payload returns
+  `ErrTooLarge` immediately, with no waiting, no buffering and no
+  consumed sequence. Writing to a closed channel returns
   `ErrChannelClosed`; an out-of-range channel returns `ErrChecksum`.
 - `(*Mux).CloseChannel(ch) error` closes one channel's write side: the
-  FIN is itself a sequence entry (it takes one quota slot, so a full
-  quota gives `ErrWindowFull` and the close is retried after acks); a
-  channel that was never written is opened first, so an unused channel
-  still delivers a clean EOF. Closing or writing an already closed
-  channel returns `ErrChannelClosed`.
+  FIN is itself a sequence entry (it takes one quota slot), so a full
+  quota parks the close behind the channel's earlier writes and it
+  completes after acks; a channel that was never written is opened
+  first, so an unused channel still delivers a clean EOF. Closing or
+  writing an already closed channel returns `ErrChannelClosed`.
+- `(*Mux).Pressure() PressureReport` is a read-only observation entry:
+  it reports, per channel, the admitted in-flight frame count
+  (`InFlight`), the current quota (`Quota`, in `[1,Window]`) and whether
+  a write or close is currently parked waiting for quota (`Waiting`). It
+  never blocks admission or transmission.
 - `(*Mux).Flush() error` sends queued frames round-robin across
   channels (each pass serves at most one queued frame per channel,
   starting where the previous Flush stopped), so one busy channel can
@@ -166,15 +181,18 @@ all established error values keep their exact semantics.
 
 Restart uses the same durable rules as the reliable layer: written data
 frames are CRC-recorded in a shared journal (`mux.log`), acknowledged
-per-channel positions in dual-slot checkpoints (`muxNNN.ckp`), and a
-close marker (`muxNNN.closed`) survives a FIN whose journal prefix was
-discarded. Recovery resumes each channel at the earlier of the
-checkpoint and journal positions, so no unacknowledged frame is skipped
-and the receiver deduplicates the overlap; a truncated journal or a
-flipped bit in a complete record fails recovery with `ErrChecksum`. If
-the close marker cannot be written, the close still takes effect: the
-FIN is already journaled, so the in-memory state and the journal stay
-consistent and a later restart recovers the same closed channel.
+per-channel positions in dual-slot checkpoints (`muxNNN.ckp`), the
+adaptive quota in a strict checksummed per-channel file (`muxNNN.flow`),
+and a close marker (`muxNNN.closed`) survives a FIN whose journal prefix
+was discarded. Recovery resumes each channel at the earlier of the
+checkpoint and journal positions and restores its quota, which then
+keeps adjusting from the recovered value, so no unacknowledged frame is
+skipped and the receiver deduplicates the overlap; a truncated journal,
+a damaged quota file or a flipped bit in a complete record fails
+recovery with `ErrChecksum`. If the close marker cannot be written, the
+close still takes effect: the FIN is already journaled, so the in-memory
+state and the journal stay consistent and a later restart recovers the
+same closed channel.
 
 ## Fragmentation and reassembly
 
@@ -196,18 +214,29 @@ The fragment header lives only inside the mux payload
   reserved inside the mux payload, so one fragment carries at most
   `FragMaxPayload = MuxMaxPayload - FragHeaderSize` chunk bytes.
 - `(*FragSession).WriteFrame(FragFrame) error` slices the payload into
-  ordered fragments and queues every fragment of the message
-  atomically, so two messages of one channel never interleave; nothing
-  goes out before `Flush`. A payload larger than `MaxMessage` returns
-  `ErrTooLarge`; a channel whose in-flight quota is already exhausted
-  returns `ErrWindowFull` (the same value as `ErrTooLarge`); both drop
-  the write without consuming a message or frame sequence, so a
-  rejected payload takes no buffer. Writing to a closed channel returns
-  `ErrChannelClosed`; an out-of-range channel returns `ErrChecksum`.
+  ordered fragments and queues every fragment of the message as one
+  contiguous per-channel run, so two messages of one channel never
+  interleave; nothing goes out before `Flush`. Each fragment counts
+  against the channel's current in-flight quota individually: a legal
+  write parks fragment by fragment in arrival order and completes as
+  acknowledgements release quota, rather than being rejected. A payload
+  larger than `MaxMessage`, or one whose fragment count exceeds the mux
+  window width (it could never fit even one frame on the wire), returns
+  `ErrTooLarge` immediately - no backpressure wait, no buffering and no
+  consumed message or frame sequence. Writing to a closed channel
+  returns `ErrChannelClosed`; an out-of-range channel returns
+  `ErrChecksum`.
 - `(*FragSession).Flush() error` is the mux flush: fragments go out
   round-robin across channels, so one channel's fragments may be
   interleaved with other channels' frames, and a message whose
   fragments span several windows drains as acknowledgements arrive.
+  Because a write can now block on quota, a peer that needs the peer's
+  acks to free quota must keep `ReadFrame` (and a periodic `Flush`)
+  running while writes proceed.
+- `(*FragSession).Pressure() PressureReport` is the read-only
+  observation entry of the wrapped mux: per channel it gives the
+  admitted in-flight frame count, the current adaptive quota and whether
+  a write or close is parked waiting for quota.
 - `(*FragSession).ReadFrame() (FragFrame, error)` delivers one
   reassembled message per call, exactly once, with byte content and
   call order identical to the writes; a message stalled mid-assembly on
@@ -219,10 +248,13 @@ The fragment header lives only inside the mux payload
   past the send frontier, an unknown flag, a malformed standalone
   acknowledgement, or a damaged fragment header is refused with
   `ErrChecksum` - the bare established value, comparable directly with
-  `==` - and stops delivery stickily at the current position. Mux
-  results (the per-channel `io.EOF` at a channel's FIN, the transport's
-  `io.EOF`, `ErrShortFrame`, outer checksum/version/size and reader
-  errors) pass through unchanged.
+  `==` - and stops delivery stickily at the current position. If the
+  reassembly state cannot be written through, the underlying I/O error
+  is returned unchanged and delivery stops stickily: this layer never
+  swallows the error and keeps emitting messages from an uncheckpointed
+  position. Mux results (the per-channel `io.EOF` at a channel's FIN,
+  the transport's `io.EOF`, `ErrShortFrame`, outer checksum/version/size
+  and reader errors) pass through unchanged.
 - `(*FragSession).CloseChannel(ch) error` closes the channel's write
   side through the mux and waits for the acknowledgement pump to wind
   down before returning; a second close returns `ErrChannelClosed`, and

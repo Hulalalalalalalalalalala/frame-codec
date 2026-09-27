@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ---- deterministic mux harness ---------------------------------------------
@@ -293,7 +294,20 @@ func TestMuxEmptyChannelDeliversEOF(t *testing.T) {
 	}
 }
 
-func TestMuxQuotaFullIsOverLimitAndReleasesOnAck(t *testing.T) {
+// waitMuxWaiting polls Pressure until channel ch's Waiting flag reaches
+// want (a blocked writer settles onto the condition asynchronously).
+func waitMuxWaiting(t *testing.T, m *Mux, ch uint16, want bool) {
+	t.Helper()
+	for i := 0; i < 400; i++ {
+		if m.Pressure().Channels[ch].Waiting == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("channel %d Waiting never reached %v: %+v", ch, want, m.Pressure().Channels[ch])
+}
+
+func TestMuxWriteParksUnderQuotaAndReleasesInOrder(t *testing.T) {
 	const W = 3
 	cfg := muxCfg(t, 2, W)
 	var wire bytes.Buffer
@@ -304,52 +318,93 @@ func TestMuxQuotaFullIsOverLimitAndReleasesOnAck(t *testing.T) {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
-	// Quota exactly full: the established over-limit sentinel, same
-	// value as ErrTooLarge; frame dropped, no sequence consumed.
-	err := snd.WriteFrame(ChannelFrame{Channel: 0, Kind: 99, Payload: []byte("drop")})
-	if !errors.Is(err, ErrWindowFull) || !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("err = %v, want ErrWindowFull == ErrTooLarge", err)
-	}
-	// Another channel is unaffected by the full quota of channel 0.
+	// The next two ch0 writes park in arrival order; neither is rejected
+	// and neither consumes a sequence before its slot is free.
+	done4 := make(chan error, 1)
+	go func() {
+		done4 <- snd.WriteFrame(ChannelFrame{Channel: 0, Kind: 99, Payload: []byte("fourth")})
+	}()
+	waitMuxWaiting(t, snd, 0, true)
+	done5 := make(chan error, 1)
+	go func() {
+		done5 <- snd.WriteFrame(ChannelFrame{Channel: 0, Kind: 88, Payload: []byte("fifth")})
+	}()
+
+	// Another channel is unaffected by ch0's saturated quota.
 	if err := snd.WriteFrame(ChannelFrame{Channel: 1, Kind: 5, Payload: []byte("other")}); err != nil {
-		t.Fatalf("ch1 write while ch0 full: %v", err)
+		t.Fatalf("ch1 write while ch0 saturated: %v", err)
 	}
+
+	p := snd.Pressure()
+	if p.Channels[0].InFlight != W || p.Channels[0].Quota != W || !p.Channels[0].Waiting {
+		t.Fatalf("ch0 pressure = %+v, want in-flight %d quota %d waiting", p.Channels[0], W, W)
+	}
+	if p.Channels[1].InFlight != 1 || p.Channels[1].Quota != W || p.Channels[1].Waiting {
+		t.Fatalf("ch1 pressure = %+v, want in-flight 1 quota %d not waiting", p.Channels[1], W)
+	}
+
 	if err := snd.Flush(); err != nil {
 		t.Fatal(err)
 	}
-
-	ws := parseMuxWire(t, wire.Bytes(), 0)
-	if fmt.Sprint(muxChansSeq(ws)) != "[0:0 1:0 0:1 0:2]" {
-		t.Fatalf("wire order = %v, want round-robin [0:0 1:0 0:1 0:2]", muxChansSeq(ws))
+	if fmt.Sprint(muxChansSeq(parseMuxWire(t, wire.Bytes(), 0))) != "[0:0 1:0 0:1 0:2]" {
+		t.Fatalf("wire order = %v, want round-robin [0:0 1:0 0:1 0:2]",
+			muxChansSeq(parseMuxWire(t, wire.Bytes(), 0)))
 	}
 
-	// Ack two ch0 frames at the mux layer: two quota slots free,
-	// numbering continues at 3. The send-only reliable layer is driven
-	// directly too (as the reliable layer's own tests do), freeing its
-	// window so the resend plus the new frame all go out.
-	snd.applyAck(0, 2)
-	snd.rel.applyAck(4)
-	if err := snd.WriteFrame(ChannelFrame{Channel: 0, Kind: 99, Payload: []byte("after")}); err != nil {
-		t.Fatalf("write after ack: %v", err)
+	// One ack frees exactly one slot: the first parked write (FIFO) gets
+	// seq 3; the second is still parked behind it.
+	snd.applyAck(0, 1)
+	select {
+	case err := <-done4:
+		if err != nil {
+			t.Fatalf("first parked write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first parked write did not complete after one ack")
 	}
-	wire.Reset()
-	if err := snd.Flush(); err != nil {
-		t.Fatal(err)
+	select {
+	case <-done5:
+		t.Fatal("second parked write completed before a second slot was free")
+	default:
 	}
-	var ch0 []uint32
-	for _, w := range parseMuxWire(t, wire.Bytes(), 0) {
-		if w.ch == 0 {
-			ch0 = append(ch0, w.seq)
+	if snd.sc[0].next != 4 {
+		t.Fatalf("next = %d, want 4 after first parked write", snd.sc[0].next)
+	}
+
+	// The next ack frees the second slot, completing the parked tail.
+	snd.applyAck(0, 3)
+	select {
+	case err := <-done5:
+		if err != nil {
+			t.Fatalf("second parked write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second parked write did not complete")
+	}
+	if snd.sc[0].next != 5 {
+		t.Fatalf("next = %d, want 5", snd.sc[0].next)
+	}
+	waitMuxWaiting(t, snd, 0, false)
+
+	// The admitted tail is queued under its FIFO-assigned sequences 3
+	// and 4 (the acked 0..2 already left the queue); in-flight is two
+	// and never crossed the (still fully open) quota.
+	var queued []uint32
+	for _, qf := range snd.queue {
+		if qf.channel == 0 {
+			queued = append(queued, qf.seq)
 		}
 	}
-	// Acked 0,1 never reappear; 2 is the still-in-flight retransmit and
-	// 3 is the new frame, proving the rejected write consumed no seq.
-	if fmt.Sprint(ch0) != "[2 3]" {
-		t.Fatalf("ch0 seqs = %v, want [2 3]", ch0)
+	if fmt.Sprint(queued) != "[3 4]" {
+		t.Fatalf("queued ch0 seqs = %v, want [3 4]", queued)
+	}
+	pc := snd.Pressure().Channels[0]
+	if pc.InFlight != 2 || pc.Quota != W || pc.Waiting {
+		t.Fatalf("final ch0 pressure = %+v, want in-flight 2 quota %d not waiting", pc, W)
 	}
 }
 
-func TestMuxQuotaExactlyFullBoundary(t *testing.T) {
+func TestMuxCloseParksWhenQuotaFullAndCompletesOnAck(t *testing.T) {
 	const W = 4
 	cfg := muxCfg(t, 1, W)
 	var wire bytes.Buffer
@@ -359,16 +414,136 @@ func TestMuxQuotaExactlyFullBoundary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := snd.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("x")}); !errors.Is(err, ErrWindowFull) {
-		t.Fatalf("W+1 err = %v, want ErrWindowFull", err)
-	}
-	// FIN also competes for a quota slot.
-	if err := snd.CloseChannel(0); !errors.Is(err, ErrWindowFull) {
-		t.Fatalf("close at full quota err = %v, want ErrWindowFull", err)
-	}
+	// The FIN competes for a slot: it parks behind the full quota and
+	// completes once an acknowledgement frees one.
+	closed := make(chan error, 1)
+	go func() { closed <- snd.CloseChannel(0) }()
+	waitMuxWaiting(t, snd, 0, true)
+
 	snd.applyAck(0, 1)
-	if err := snd.CloseChannel(0); err != nil {
-		t.Fatalf("close after one ack: %v", err)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("parked close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked close did not complete after one ack")
+	}
+	waitMuxWaiting(t, snd, 0, false)
+	if snd.sc[0].next != uint32(W+1) || !snd.sc[0].closed {
+		t.Fatalf("state = next %d closed %v, want FIN at seq %d", snd.sc[0].next, snd.sc[0].closed, W)
+	}
+	// Once the FIN is admitted the channel is closed for writes.
+	if err := snd.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("x")}); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("write after parked close err = %v, want ErrChannelClosed", err)
+	}
+}
+
+func TestMuxAdaptiveQuotaTightensAndRelaxes(t *testing.T) {
+	cfg := muxCfg(t, 2, 4)
+	var wire bytes.Buffer
+	snd := newMuxSender(t, &wire, cfg)
+
+	// Two frames sent, then re-sent before any acknowledgement: the
+	// retransmit proves the path needed repair, so when they are
+	// confirmed ch0's quota tightens all the way to its floor of 1.
+	for i := 0; i < 2; i++ {
+		if err := snd.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	snd.applyAck(0, 2)
+	if q := snd.Pressure().Channels[0].Quota; q != 1 {
+		t.Fatalf("quota after retransmit = %d, want 1", q)
+	}
+	// Other channels are independent.
+	if q := snd.Pressure().Channels[1].Quota; q != 4 {
+		t.Fatalf("ch1 quota = %d, want untouched 4", q)
+	}
+
+	// At quota 1 exactly one new frame is admitted; the next parks.
+	if err := snd.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	parked := make(chan error, 1)
+	go func() { parked <- snd.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("b")}) }()
+	waitMuxWaiting(t, snd, 0, true)
+
+	// One timely acknowledgement relaxes the quota by one; the parked
+	// frame is then admitted (in-flight 1, quota 2).
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	snd.applyAck(0, 3)
+	select {
+	case err := <-parked:
+		if err != nil {
+			t.Fatalf("parked write after relaxation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked write did not complete after quota relaxed")
+	}
+	p := snd.Pressure().Channels[0]
+	if p.Quota != 2 || p.InFlight != 1 || p.Waiting {
+		t.Fatalf("pressure after relaxation = %+v, want quota 2 in-flight 1 not waiting", p)
+	}
+}
+
+func TestMuxFlowStateRecoveredAndChecked(t *testing.T) {
+	dir := t.TempDir()
+	cfg := MuxConfig{Channels: 1, Window: 4, StateDir: dir}
+	relCfg := ReliableConfig{Window: 8, StateDir: filepath.Join(dir, "rel")}
+
+	// A durable quota of 1 is recovered and immediately in force: one
+	// frame admitted, the next parks.
+	if err := saveMuxFlow(dir, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	var wire bytes.Buffer
+	rel, err := NewReliable(NewSession(&wire, closedReader{}), relCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewMux(rel, cfg)
+	if err != nil {
+		t.Fatalf("recover flow state: %v", err)
+	}
+	if q := s.Pressure().Channels[0].Quota; q != 1 {
+		t.Fatalf("recovered quota = %d, want 1", q)
+	}
+	if err := s.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	parked := make(chan error, 1)
+	go func() { parked <- s.WriteFrame(ChannelFrame{Channel: 0, Payload: []byte("b")}) }()
+	waitMuxWaiting(t, s, 0, true)
+	s.Close()
+	rel.Close()
+
+	// A damaged flow file fails recovery with ErrChecksum.
+	path := muxFlowPath(dir, 0)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[0] ^= 0x01
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rel2, err := NewReliable(NewSession(&bytes.Buffer{}, closedReader{}),
+		ReliableConfig{Window: 8, StateDir: filepath.Join(dir, "rel2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rel2.Close()
+	if _, err := NewMux(rel2, cfg); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("damaged flow state err = %v, want ErrChecksum", err)
 	}
 }
 
@@ -1079,17 +1254,34 @@ func TestMuxFullDuplex(t *testing.T) {
 		}
 	}()
 
+	// With blocking admission a write that parks on quota still needs a
+	// concurrent Flush to push its queued frames and earn the acks that
+	// release it, so a dedicated pump flushes while writes proceed (the
+	// single-goroutine "flush after each write" pattern can deadlock once
+	// a write blocks).
+	flushStop := make(chan struct{})
+	flusherDone := make(chan struct{})
+	go func() {
+		defer close(flusherDone)
+		for {
+			select {
+			case <-flushStop:
+				return
+			default:
+			}
+			if err := ma.Flush(); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
 	for ch := 0; ch < 3; ch++ {
 		for i := 0; i < perCh; i++ {
 			if err := ma.WriteFrame(ChannelFrame{
 				Channel: uint16(ch), Kind: uint8(ch), Payload: []byte(fmt.Sprintf("c%d-%04d", ch, i)),
 			}); err != nil {
 				t.Fatalf("write ch%d i%d: %v", ch, i, err)
-			}
-			if i%9 == 0 {
-				if err := ma.Flush(); err != nil {
-					t.Fatal(err)
-				}
 			}
 		}
 	}
@@ -1098,11 +1290,10 @@ func TestMuxFullDuplex(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := ma.Flush(); err != nil {
-		t.Fatal(err)
-	}
 
 	<-allDone
+	close(flushStop)
+	<-flusherDone
 	a.Close()
 	b.Close()
 

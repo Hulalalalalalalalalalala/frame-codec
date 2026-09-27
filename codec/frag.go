@@ -52,12 +52,15 @@ import (
 //     channel. Channels are independent: a message stalled mid-assembly
 //     on one channel never blocks another channel's delivery.
 //   - The send side numbers messages in write order and queues every
-//     fragment of an accepted message atomically; nothing goes out
-//     before Flush. A payload larger than the configured per-channel
-//     reassembly cap returns ErrTooLarge, and a channel whose in-flight
-//     quota is already exhausted returns ErrWindowFull (the same value
-//     as ErrTooLarge); both drop the write without consuming a message
-//     or frame sequence, so a rejected payload takes no buffer.
+//     fragment of an accepted message as one contiguous per-channel run;
+//     nothing goes out before Flush. A payload larger than the configured
+//     per-channel reassembly cap, or one whose fragment count exceeds the
+//     mux window width (a message that could never fit even one frame on
+//     the wire), returns ErrTooLarge immediately: no backpressure wait,
+//     no buffer and no consumed sequence. Any other legal write is
+//     admitted fragment by fragment: the run parks in arrival order and
+//     completes as acknowledgements release the channel's adaptive quota,
+//     so a legal payload is never rejected for being in flight.
 //   - The receive side keeps one bounded reassembly buffer per channel
 //     (at most MaxMessage bytes). A fragment whose declared total
 //     exceeds the cap is dropped with ErrTooLarge and the stream
@@ -221,16 +224,19 @@ func NewFrag(m *Mux, cfg FragConfig) (*FragSession, error) {
 
 // WriteFrame slices f.Payload into ordered fragments and queues every
 // fragment on channel f.Channel as ordinary mux frames; nothing reaches
-// the wire before Flush. The whole message is accepted atomically, so
-// its fragments can never interleave with another message of the same
-// channel.
+// the wire before Flush. The fragments of one message occupy one
+// contiguous per-channel admission run, so they can never interleave
+// with another message of the same channel; each fragment counts against
+// the channel's adaptive in-flight quota individually and the run waits
+// in arrival order for quota to be released.
 //
-// It returns ErrTooLarge for a payload larger than the configured
-// reassembly cap, ErrChecksum for a channel number outside the session,
-// ErrWindowFull (the same value as ErrTooLarge) when the channel's
-// in-flight quota is already exhausted, and ErrChannelClosed when the
-// channel's write side has been closed. A rejected payload is neither
-// queued nor journaled and consumes no message or frame sequence.
+// It returns ErrTooLarge immediately, without waiting or buffering
+// anything, for a payload larger than the configured reassembly cap, a
+// payload whose fragment count exceeds the mux window width (it could
+// never fit even one frame on the wire), or an oversized single
+// fragment; ErrChecksum for a channel number outside the session; and
+// ErrChannelClosed when the channel's write side has been closed. A
+// refused message consumes no message or frame sequence.
 func (fs *FragSession) WriteFrame(f FragFrame) error {
 	if len(f.Payload) > fs.cfg.MaxMessage {
 		return ErrTooLarge
@@ -240,13 +246,19 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 	}
 
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
 	msg := fs.sendNext[f.Channel]
 	total := uint32(len(f.Payload))
 	n := 1
 	if len(f.Payload) > 0 {
 		n = (len(f.Payload) + FragMaxPayload - 1) / FragMaxPayload
+	}
+	// A message needing more fragments than the peer's fixed window
+	// width could never be placed: even a fully open quota reaches only
+	// Window. Refuse it outright - it must not queue forever - without
+	// consuming a sequence.
+	if n > fs.mux.cfg.Window {
+		fs.mu.Unlock()
+		return ErrTooLarge
 	}
 	frames := make([]ChannelFrame, 0, n)
 	for i := 0; i < n; i++ {
@@ -267,13 +279,29 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 				fs.recv[f.Channel].next, f.Payload[lo:hi]),
 		})
 	}
-	if err := fs.mux.writeFragments(frames); err != nil {
+	// Reserve the message sequence and the run's consecutive FIFO
+	// tickets under this layer's lock (so two messages of one channel
+	// can never interleave), then release it: the blocking commit waits
+	// for quota on the mux lock alone, which must not stop inbound acks
+	// from being processed on ReadFrame.
+	ch, ticket, err := fs.mux.prepareRun(frames)
+	if err != nil {
+		fs.mu.Unlock()
 		return err
 	}
 	fs.sendNext[f.Channel]++
+	fs.mu.Unlock()
+
+	if err := fs.mux.commitRun(frames, ch, ticket); err != nil {
+		return err
+	}
+
 	// The send position is durable before the write returns: after a
 	// restart, numbering must never reuse a message sequence the peer
-	// may already have received.
+	// may already have received. A failed write-through returns the
+	// underlying I/O error; the journaled fragments stay recoverable.
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	return fs.persistLocked(f.Channel)
 }
 
@@ -284,6 +312,14 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 // from the journal, so Flush is also the retransmit operation.
 func (fs *FragSession) Flush() error {
 	return fs.mux.Flush()
+}
+
+// Pressure is the read-only observation entry: it reports, per channel,
+// the admitted in-flight frame count, the current adaptive quota and
+// whether a write or close is parked waiting for quota. It is a snapshot
+// of the wrapped mux and never blocks admission or transmission.
+func (fs *FragSession) Pressure() PressureReport {
+	return fs.mux.Pressure()
 }
 
 // ReadFrame returns the next completely reassembled message across all
@@ -301,7 +337,10 @@ func (fs *FragSession) Flush() error {
 // acknowledgement, and a damaged fragment header. Mux results (the
 // per-channel io.EOF at a channel's FIN, the transport's io.EOF,
 // ErrShortFrame, outer checksum/version/size and reader errors) pass
-// through unchanged.
+// through unchanged. If the reassembly state cannot be written through,
+// the underlying I/O error is returned unchanged and delivery stops
+// stickily: this layer never swallows the error and keeps handing out
+// messages from an uncheckpointed position.
 func (fs *FragSession) ReadFrame() (FragFrame, error) {
 	for {
 		fs.mu.Lock()
@@ -311,11 +350,11 @@ func (fs *FragSession) ReadFrame() (FragFrame, error) {
 			return FragFrame{}, err
 		}
 		// A message whose final fragment already arrived is finalized
-		// (position persisted) and delivered here, so a persist failure
-		// is retried on the next call instead of losing the message.
+		// (position persisted) and delivered here. A failed write-through
+		// is terminal: the raw I/O error sticks and delivery stops rather
+		// than retrying past an uncheckpointed position.
 		if ff, ok, err := fs.tryFinalizeLocked(); err != nil {
-			fs.mu.Unlock()
-			return FragFrame{}, err
+			return fs.failReadLocked(err)
 		} else if ok {
 			fs.mu.Unlock()
 			return ff, nil
@@ -444,8 +483,13 @@ func (fs *FragSession) ReadFrame() (FragFrame, error) {
 		}
 		// Write the reassembly state through before the mux can
 		// acknowledge this fragment past the sender: after a restart the
-		// assembly resumes from exactly this position.
-		_ = fs.persistLocked(ch)
+		// assembly resumes from exactly this position. A failed
+		// write-through is terminal - surface the raw I/O error and stop
+		// delivery rather than acknowledging past an uncheckpointed
+		// position.
+		if err := fs.persistLocked(ch); err != nil {
+			return fs.failReadLocked(err)
+		}
 		fs.signalAckLocked()
 		fs.mu.Unlock()
 	}
@@ -523,9 +567,10 @@ func (fs *FragSession) pumpAck() {
 }
 
 // sendAcks writes one standalone cumulative acknowledgement for every
-// channel whose receive position moved since sent. Best effort: a
-// failed or blocked ack is harmless because every later fragment
-// piggybacks the same cumulative position.
+// channel whose receive position moved since sent. Best effort: the
+// enqueue never blocks on quota (a skipped ack is harmless because every
+// later fragment piggybacks the same cumulative position) and a failed
+// write is ignored.
 func (fs *FragSession) sendAcks(sent []uint32) {
 	fs.mu.Lock()
 	pos := make([]uint32, fs.channels)
@@ -540,7 +585,8 @@ func (fs *FragSession) sendAcks(sent []uint32) {
 			continue
 		}
 		hdr := encodeFragHeader(0, 0, 0, fhFlagAck, pos[ch], nil)
-		if err := fs.mux.WriteFrame(ChannelFrame{Channel: uint16(ch), Payload: hdr}); err != nil {
+		admitted, err := fs.mux.tryWriteFrame(ChannelFrame{Channel: uint16(ch), Payload: hdr})
+		if err != nil || !admitted {
 			continue
 		}
 		sent[ch] = pos[ch]
