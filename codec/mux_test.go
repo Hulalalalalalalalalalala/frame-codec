@@ -823,6 +823,7 @@ func TestMuxRestartOverlapDeduped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rs.Close(); rel2.Close() })
 	if rs.sc[0].acked != 0 || rs.sc[0].next != 5 {
 		t.Fatalf("positions = %d/%d, want 0/5 (earlier confirmed position)", rs.sc[0].acked, rs.sc[0].next)
 	}
@@ -844,6 +845,7 @@ func TestMuxRestartOverlapDeduped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rcv.Close(); rcvR.Close() })
 	rcv.bases[0] = 3 // peer already delivered 0..2 on the old connection
 	f.replace(wire.Bytes())
 	got := drainMux(t, rcv, 2)

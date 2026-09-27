@@ -35,6 +35,29 @@ func newFragSender(t *testing.T, buf *bytes.Buffer, c MuxConfig, maxMsg int) *Fr
 	return fs
 }
 
+// newFragSenderRW is newFragSender with an explicit reliable window:
+// tests that drive many flushes without a peer need the reliable window
+// to stay open while retransmissions accumulate in it.
+func newFragSenderRW(t *testing.T, buf *bytes.Buffer, c MuxConfig, relWindow, maxMsg int) *FragSession {
+	t.Helper()
+	mc, rc := sideCfg(c, "snd")
+	rc.Window = relWindow
+	rel, err := NewReliable(NewSession(buf, closedReader{}), rc)
+	if err != nil {
+		t.Fatalf("NewReliable sender: %v", err)
+	}
+	m, err := NewMux(rel, mc)
+	if err != nil {
+		t.Fatalf("NewMux sender: %v", err)
+	}
+	fs, err := NewFrag(m, FragConfig{MaxMessage: maxMsg, StateDir: filepath.Join(mc.StateDir, "frag")})
+	if err != nil {
+		t.Fatalf("NewFrag sender: %v", err)
+	}
+	t.Cleanup(func() { fs.Close(); rel.Close() })
+	return fs
+}
+
 // newFragReceiver builds a frag reader over f; its standalone acks go to
 // io.Discard (deterministic tests drive acks from parsed wire).
 func newFragReceiver(t *testing.T, f *feed, c MuxConfig, maxMsg int) *FragSession {
@@ -108,13 +131,27 @@ func fragPattern(n int) []byte {
 func waitForFragState(t *testing.T, dir string, ch uint16, want int) {
 	t.Helper()
 	for i := 0; i < 400; i++ {
-		_, rc, err := loadFragState(dir, ch, 1<<30)
+		_, _, rc, err := loadFragState(dir, ch, 1<<30, 1<<30)
 		if err == nil && len(rc.buf) == want {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("state file did not reach %d buffered bytes", want)
+}
+
+// waitForPressure polls until the channel's Pressure snapshot satisfies
+// pred, returning the first satisfying snapshot.
+func waitForPressure(t *testing.T, fs *FragSession, ch uint16, pred func(Pressure) bool) Pressure {
+	t.Helper()
+	for i := 0; i < 400; i++ {
+		if p := fs.Pressure(ch); pred(p) {
+			return p
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("pressure on ch %d did not reach the expected state: %+v", ch, fs.Pressure(ch))
+	return Pressure{}
 }
 
 // ---- wire format --------------------------------------------------------------
@@ -268,7 +305,7 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := NewMux(rel, MuxConfig{Channels: 2, Window: 2, StateDir: filepath.Join(dir, sub)})
+		m, err := NewMux(rel, MuxConfig{Channels: 2, Window: 8, StateDir: filepath.Join(dir, sub)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -282,7 +319,8 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 	fa := mk(a, "a")
 	fb := mk(b, "b")
 
-	// Six fragments through a window of two.
+	// Six fragments through a window of eight, with twenty more messages
+	// queued behind it: the pipeline drains as acknowledgements arrive.
 	big := fragPattern(5*FragMaxPayload + 12345)
 	const smalls = 20
 
@@ -345,8 +383,9 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 		}
 	}()
 
-	// The big message is accepted in one call even though its fragments
-	// span several windows.
+	// The big message is accepted in one call: its six fragments fit the
+	// window, and later writes suspend inside WriteFrame until
+	// acknowledgements free quota again.
 	if err := fa.WriteFrame(FragFrame{Channel: 0, Kind: 7, Payload: big}); err != nil {
 		t.Fatalf("big write: %v", err)
 	}
@@ -379,22 +418,17 @@ func TestFragRoundTripLargeMultiWindow(t *testing.T) {
 	}
 	for i := 0; i < smalls; i++ {
 		payload := []byte(fmt.Sprintf("s%02d", i))
-		for {
-			select {
-			case res := <-resCh:
-				t.Fatalf("collector exited during small %d: err=%v", i, res.err)
-			case <-time.After(10 * time.Second):
-				t.Fatalf("timed out during small %d", i)
-			default:
-			}
-			err := fa.WriteFrame(FragFrame{Channel: 1, Kind: uint8(i), Payload: payload})
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, ErrWindowFull) {
-				t.Fatalf("small write %d: %v", i, err)
-			}
-			time.Sleep(time.Millisecond)
+		select {
+		case res := <-resCh:
+			t.Fatalf("collector exited during small %d: err=%v", i, res.err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out during small %d", i)
+		default:
+		}
+		// A quota-tight channel suspends the write instead of
+		// rejecting it; the flusher and the reader keep it draining.
+		if err := fa.WriteFrame(FragFrame{Channel: 1, Kind: uint8(i), Payload: payload}); err != nil {
+			t.Fatalf("small write %d: %v", i, err)
 		}
 	}
 	waitQuota("close0")
@@ -449,7 +483,7 @@ func TestFragOverCapWriteRejected(t *testing.T) {
 	}
 }
 
-func TestFragQuotaFullRejected(t *testing.T) {
+func TestFragQuotaFullBlocks(t *testing.T) {
 	const W = 2
 	cfg := muxCfg(t, 1, W)
 	var wire bytes.Buffer
@@ -459,23 +493,336 @@ func TestFragQuotaFullRejected(t *testing.T) {
 	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: fragPattern(FragMaxPayload + 1)}); err != nil {
 		t.Fatal(err)
 	}
-	err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("drop")})
-	if err != ErrWindowFull || err != ErrTooLarge {
-		t.Fatalf("quota err = %v, want ErrWindowFull == ErrTooLarge", err)
+	if p := snd.Pressure(0); p.InFlight != 2 || p.Quota != W || p.Backpressure {
+		t.Fatalf("pressure = %+v, want {InFlight:2 Quota:2 Backpressure:false}", p)
 	}
-	// Acks free the quota; the retried write takes the next message
-	// sequence, proving the rejected one consumed none.
+
+	// The next legal write is not rejected: it suspends until quota
+	// frees, and Pressure reports the backpressure.
+	done := make(chan error, 1)
+	go func() { done <- snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("keep")}) }()
+	waitForPressure(t, snd, 0, func(p Pressure) bool { return p.Backpressure })
+
+	// Acks free the quota; the suspended write completes and takes the
+	// next message sequence, proving the wait consumed none.
 	snd.mux.applyAck(0, 2)
 	snd.mux.rel.applyAck(2)
-	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("keep")}); err != nil {
-		t.Fatalf("write after ack: %v", err)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("suspended write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write still suspended after acknowledgements")
+	}
+	if p := snd.Pressure(0); p.Backpressure {
+		t.Fatalf("pressure = %+v, want no backpressure after completion", p)
 	}
 	if err := snd.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	ws := parseFragWire(t, wire.Bytes(), 0)
-	if len(ws) != 1 || ws[0].msg != 1 || ws[0].muxSeq != 2 || string(ws[0].chunk) != "keep" {
-		t.Fatalf("wire = %+v, want msg 1 at mux seq 2", ws)
+	if len(ws) == 0 || ws[len(ws)-1].msg != 1 || ws[len(ws)-1].muxSeq != 2 ||
+		string(ws[len(ws)-1].chunk) != "keep" {
+		t.Fatalf("wire = %+v, want last fragment msg 1 at mux seq 2", ws)
+	}
+}
+
+func TestFragBackpressureFIFO(t *testing.T) {
+	const W = 2
+	cfg := muxCfg(t, 1, W)
+	var wire bytes.Buffer
+	snd := newFragSenderRW(t, &wire, cfg, 64, 1<<20)
+
+	// Fill the quota, then queue two writers behind it.
+	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: fragPattern(FragMaxPayload + 1)}); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { first <- snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("first")}) }()
+	waitForPressure(t, snd, 0, func(p Pressure) bool { return p.Backpressure })
+	go func() { second <- snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("second")}) }()
+
+	// One acknowledgement frees exactly one slot: the earlier writer
+	// completes, the later one keeps waiting.
+	snd.mux.applyAck(0, 1)
+	snd.mux.rel.applyAck(1)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first write did not complete after one ack")
+	}
+	select {
+	case err := <-second:
+		t.Fatalf("second write completed early (%v), want arrival order", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	snd.mux.applyAck(0, 2)
+	snd.mux.rel.applyAck(2)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second write did not complete after two acks")
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// On the wire the suspended messages keep their arrival order.
+	ws := parseFragWire(t, wire.Bytes(), 0)
+	var msgs []string
+	for _, w := range ws {
+		msgs = append(msgs, string(w.chunk))
+	}
+	want := []string{"first", "second"}
+	if len(msgs) < 2 || msgs[len(msgs)-2] != want[0] || msgs[len(msgs)-1] != want[1] {
+		t.Fatalf("wire messages = %v, want tail %v", msgs, want)
+	}
+}
+
+func TestFragMessageWiderThanWindowRejected(t *testing.T) {
+	cfg := muxCfg(t, 1, 2)
+	var wire bytes.Buffer
+	snd := newFragSender(t, &wire, cfg, 1<<20)
+
+	// Three fragments can never fit a window of two, however the quota
+	// adapts: immediate ErrTooLarge, no wait, no sequence consumed.
+	err := snd.WriteFrame(FragFrame{Channel: 0, Payload: fragPattern(2*FragMaxPayload + 1)})
+	if err != ErrTooLarge {
+		t.Fatalf("over-window err = %v, want ErrTooLarge", err)
+	}
+	if p := snd.Pressure(0); p.InFlight != 0 {
+		t.Fatalf("in-flight = %d, want 0 after rejected write", p.InFlight)
+	}
+	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("ok")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	ws := parseFragWire(t, wire.Bytes(), 0)
+	if len(ws) != 1 || ws[0].msg != 0 || string(ws[0].chunk) != "ok" {
+		t.Fatalf("wire = %+v, want one message with msg 0", ws)
+	}
+}
+
+func TestFragAdaptiveQuota(t *testing.T) {
+	const W = 4
+	cfg := muxCfg(t, 1, W)
+	var wire bytes.Buffer
+	snd := newFragSenderRW(t, &wire, cfg, 64, 1<<20)
+
+	// A fresh channel starts at the window ceiling.
+	if p := snd.Pressure(0); p.Quota != W || p.InFlight != 0 {
+		t.Fatalf("initial pressure = %+v, want {InFlight:0 Quota:4}", p)
+	}
+	for i := 0; i < 2; i++ {
+		if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// First transmission: no retransmission, quota unchanged.
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != W || p.InFlight != 2 {
+		t.Fatalf("after first flush = %+v, want {InFlight:2 Quota:4}", p)
+	}
+	// Unacknowledged frames are retransmitted: the quota tightens,
+	// halving per Flush but never below 1.
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != 2 {
+		t.Fatalf("after one retransmitting flush quota = %d, want 2", p.Quota)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != 1 {
+		t.Fatalf("after two retransmitting flushes quota = %d, want 1", p.Quota)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != 1 {
+		t.Fatalf("quota floor = %d, want 1", p.Quota)
+	}
+
+	// Timely acknowledgements relax the quota again, up to the window.
+	snd.mux.applyAck(0, 2)
+	snd.mux.rel.applyAck(2)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != 3 || p.InFlight != 0 {
+		t.Fatalf("after acks = %+v, want {InFlight:0 Quota:3}", p)
+	}
+	for i := 0; i < 3; i++ {
+		if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte{byte(10 + i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snd.mux.applyAck(0, 5)
+	snd.mux.rel.applyAck(5)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != W {
+		t.Fatalf("quota ceiling = %d, want %d", p.Quota, W)
+	}
+}
+
+func TestFragAdaptiveQuotaPerChannel(t *testing.T) {
+	cfg := muxCfg(t, 2, 4)
+	var wire bytes.Buffer
+	snd := newFragSenderRW(t, &wire, cfg, 64, 1<<20)
+
+	if err := snd.WriteFrame(FragFrame{Channel: 0, Payload: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snd.WriteFrame(FragFrame{Channel: 1, Payload: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Only channel 0 keeps retransmitting: only its quota tightens.
+	snd.mux.applyAck(1, 1)
+	snd.mux.rel.applyAck(1)
+	if err := snd.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := snd.Pressure(0); p.Quota != 2 {
+		t.Fatalf("ch0 quota = %d, want 2", p.Quota)
+	}
+	if p := snd.Pressure(1); p.Quota != 4 || p.InFlight != 0 {
+		t.Fatalf("ch1 pressure = %+v, want {InFlight:0 Quota:4}", p)
+	}
+}
+
+func TestFragRestartRestoresQuota(t *testing.T) {
+	dir := t.TempDir()
+	mcfg := MuxConfig{Channels: 1, Window: 4, StateDir: filepath.Join(dir, "snd")}
+	rcfg := ReliableConfig{Window: 16, StateDir: filepath.Join(dir, "snd", "rel")}
+	fcfg := FragConfig{MaxMessage: 1 << 20, StateDir: filepath.Join(dir, "snd", "frag")}
+
+	var wire1 bytes.Buffer
+	rel1, err := NewReliable(NewSession(&wire1, closedReader{}), rcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1, err := NewMux(rel1, mcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, err := NewFrag(m1, fcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s1.WriteFrame(FragFrame{Channel: 0, Payload: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Tighten the quota to 1 through retransmitting flushes.
+	for i := 0; i < 3; i++ {
+		if err := s1.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p := s1.Pressure(0); p.Quota != 1 || p.InFlight != 2 {
+		t.Fatalf("pre-restart pressure = %+v, want {InFlight:2 Quota:1}", p)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rel1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The adaptive state recovers with the rest of the channel state:
+	// the quota resumes from its tightened value and the unconfirmed
+	// fragments are still in flight.
+	var wire2 bytes.Buffer
+	rel2, err := NewReliable(NewSession(&wire2, closedReader{}), rcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := NewMux(rel2, mcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewFrag(m2, fcfg)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if p := s2.Pressure(0); p.Quota != 1 || p.InFlight != 2 {
+		t.Fatalf("recovered pressure = %+v, want {InFlight:2 Quota:1}", p)
+	}
+	// Adjustment continues from the recovered value: acknowledging the
+	// backlog relaxes the quota again.
+	m2.applyAck(0, 2)
+	rel2.applyAck(2)
+	if err := s2.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if p := s2.Pressure(0); p.Quota != 3 || p.InFlight != 0 {
+		t.Fatalf("post-recovery pressure = %+v, want {InFlight:0 Quota:3}", p)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rel2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFragPersistFailureStopsDelivery(t *testing.T) {
+	cfg := muxCfg(t, 1, 8)
+	fragDir := filepath.Join(cfg.StateDir, "rcv", "frag")
+	f := newFeed()
+	rcv := newFragReceiver(t, f, cfg, 1<<20)
+
+	// The first message persists and delivers normally.
+	f.replace(envWire(t, fragDataEnv(0, 0, 0, 0, 0, 1, fhFlagLast, 0, []byte("a"))))
+	if got, err := rcv.ReadFrame(); err != nil || string(got.Payload) != "a" {
+		t.Fatalf("first = %+v, %v", got, err)
+	}
+
+	// Break the state directory: the next accepted fragment cannot be
+	// persisted, and the underlying I/O error stops delivery stickily
+	// instead of being swallowed.
+	if err := os.RemoveAll(fragDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fragDir, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.replace(envWire(t, fragDataEnv(1, 1, 0, 1, 0, 1, fhFlagLast, 0, []byte("b"))))
+	_, err := rcv.ReadFrame()
+	if err == nil || err == ErrChecksum || errors.Is(err, io.EOF) {
+		t.Fatalf("persist failure err = %v, want the underlying I/O error", err)
+	}
+	if _, err := rcv.ReadFrame(); err == nil {
+		t.Fatal("persist failure must stop delivery stickily")
 	}
 }
 
@@ -704,6 +1051,7 @@ func TestFragRestartResumesAndContinues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rcv.Close(); rrel.Close() })
 	f.replace(wire1.Bytes())
 
 	g0, err := rcv.ReadFrame()
@@ -740,6 +1088,7 @@ func TestFragRestartResumesAndContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}
+	t.Cleanup(func() { s2.Close(); rel2.Close() })
 	if s2.sendNext[0] != 2 {
 		t.Fatalf("sendNext = %d, want 2", s2.sendNext[0])
 	}
@@ -814,6 +1163,7 @@ func TestFragRestartPartialMessageResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { rcv.Close(); rrel.Close() })
 	f.replace(envWire(t, dataEnvs[0], dataEnvs[1]))
 	got := make(chan FragFrame, 1)
 	go func() {

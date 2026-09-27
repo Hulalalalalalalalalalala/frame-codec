@@ -198,16 +198,28 @@ The fragment header lives only inside the mux payload
 - `(*FragSession).WriteFrame(FragFrame) error` slices the payload into
   ordered fragments and queues every fragment of the message
   atomically, so two messages of one channel never interleave; nothing
-  goes out before `Flush`. A payload larger than `MaxMessage` returns
-  `ErrTooLarge`; a channel whose in-flight quota is already exhausted
-  returns `ErrWindowFull` (the same value as `ErrTooLarge`); both drop
-  the write without consuming a message or frame sequence, so a
-  rejected payload takes no buffer. Writing to a closed channel returns
-  `ErrChannelClosed`; an out-of-range channel returns `ErrChecksum`.
+  goes out before `Flush`. A payload larger than `MaxMessage`, or a
+  message splitting into more fragments than the per-channel window
+  width (it can never fit the in-flight quota), returns `ErrTooLarge`
+  immediately; both drop the write without consuming a message or frame
+  sequence, so a rejected payload takes no buffer. Writing to a closed
+  channel returns `ErrChannelClosed`; an out-of-range channel returns
+  `ErrChecksum`. A channel whose adaptive in-flight quota has no room
+  for the whole message does NOT reject the write: the call suspends
+  and completes in call-arrival order once acknowledgements free enough
+  quota. Fragments count toward the in-flight total one by one, and the
+  count never crosses the channel's current quota.
+- `(*FragSession).Pressure(ch uint16) Pressure` is a read-only
+  observation entry: `Pressure{InFlight, Quota, Backpressure}` reports
+  the channel's unconfirmed fragment count, its current adaptive quota
+  and whether a writer is currently suspended waiting for quota. An
+  out-of-range channel reports the zero value; the call changes no
+  state.
 - `(*FragSession).Flush() error` is the mux flush: fragments go out
   round-robin across channels, so one channel's fragments may be
   interleaved with other channels' frames, and a message whose
   fragments span several windows drains as acknowledgements arrive.
+  Flush is also where the adaptive quotas tighten (see below).
 - `(*FragSession).ReadFrame() (FragFrame, error)` delivers one
   reassembled message per call, exactly once, with byte content and
   call order identical to the writes; a message stalled mid-assembly on
@@ -219,25 +231,46 @@ The fragment header lives only inside the mux payload
   past the send frontier, an unknown flag, a malformed standalone
   acknowledgement, or a damaged fragment header is refused with
   `ErrChecksum` - the bare established value, comparable directly with
-  `==` - and stops delivery stickily at the current position. Mux
-  results (the per-channel `io.EOF` at a channel's FIN, the transport's
-  `io.EOF`, `ErrShortFrame`, outer checksum/version/size and reader
-  errors) pass through unchanged.
+  `==` - and stops delivery stickily at the current position. A
+  reassembly state file that cannot be written stops delivery stickily
+  as well, returning the underlying I/O error unchanged instead of
+  swallowing it. Mux results (the per-channel `io.EOF` at a channel's
+  FIN, the transport's `io.EOF`, `ErrShortFrame`, outer
+  checksum/version/size and reader errors) pass through unchanged.
 - `(*FragSession).CloseChannel(ch) error` closes the channel's write
   side through the mux and waits for the acknowledgement pump to wind
   down before returning; a second close returns `ErrChannelClosed`, and
-  concurrent closes of one channel are safe.
+  concurrent closes of one channel are safe. The FIN takes one
+  in-flight slot, so a channel whose adaptive quota has no room (or
+  whose wait queue still holds suspended writes) returns
+  `ErrWindowFull` - the same value as `ErrTooLarge` - and the close is
+  retried after acknowledgements arrive.
 - `(*FragSession).Close() error` stops the acknowledgement pump and
   closes the wrapped mux.
 
+### Adaptive flow control and backpressure
+
+Each channel's in-flight quota (counted in fragments) adapts between a
+floor of 1 and a ceiling of the mux window width, independently of
+every other channel: it relaxes by one per confirmed fragment as
+acknowledgements advance, and it halves (never below 1) whenever a
+`Flush` retransmits a fragment that went out before. The adjustment
+changes neither the round-robin fairness across channels nor the
+fragment order within one channel. While a channel's quota has no room,
+legal writes suspend instead of failing and complete in arrival order
+as quota frees; `Pressure` reports this as `Backpressure`. As on the
+lower layers, a writer that needs the peer's acknowledgements to drain
+its quota must let `ReadFrame` run.
+
 Restart uses the same durable rules as the lower layers: the send
-position, the receive position and any partially reassembled message
-are recorded per channel in a checksummed state file (`fragNNN.state`),
-rewritten atomically on every accepted fragment, so an interrupted
-reassembly resumes from the last confirmed position with no payload
-delivered twice or skipped, and retransmitted fragments are
-deduplicated. A state file that is truncated, torn or bit-flipped fails
-recovery with `ErrChecksum`.
+position, the receive position, any partially reassembled message and
+the channel's adaptive quota are recorded per channel in a checksummed
+state file (`fragNNN.state`), rewritten atomically on every accepted
+fragment, so an interrupted reassembly resumes from the last confirmed
+position with no payload delivered twice or skipped, retransmitted
+fragments are deduplicated, and the quota resumes adjusting from its
+recovered value. A state file that is truncated, torn or bit-flipped
+fails recovery with `ErrChecksum`.
 
 ## Tests
 

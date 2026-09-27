@@ -54,10 +54,19 @@ import (
 //   - The send side numbers messages in write order and queues every
 //     fragment of an accepted message atomically; nothing goes out
 //     before Flush. A payload larger than the configured per-channel
-//     reassembly cap returns ErrTooLarge, and a channel whose in-flight
-//     quota is already exhausted returns ErrWindowFull (the same value
-//     as ErrTooLarge); both drop the write without consuming a message
-//     or frame sequence, so a rejected payload takes no buffer.
+//     reassembly cap returns ErrTooLarge, and a message whose fragment
+//     count exceeds the per-channel window width can never fit the
+//     in-flight quota and is dropped with ErrTooLarge; both consume no
+//     message or frame sequence, so a rejected payload takes no buffer.
+//   - Every channel has an adaptive in-flight quota counted in
+//     fragments, bounded below by 1 and above by the mux window width
+//     and adjusted independently of every other channel: it relaxes as
+//     acknowledgements advance and tightens when a Flush retransmits
+//     unacknowledged fragments. A write that finds no room for its
+//     message is not rejected: it suspends and completes in arrival
+//     order once quota frees. The in-flight count never crosses the
+//     current quota, and the adjustment changes neither the round-robin
+//     fairness across channels nor the fragment order within one.
 //   - The receive side keeps one bounded reassembly buffer per channel
 //     (at most MaxMessage bytes). A fragment whose declared total
 //     exceeds the cap is dropped with ErrTooLarge and the stream
@@ -66,7 +75,9 @@ import (
 //     different content, an acknowledgement past the send frontier, or
 //     a damaged fragment header is refused with ErrChecksum - the bare
 //     established value, comparable with == - and stops delivery
-//     stickily at the current position.
+//     stickily at the current position. A reassembly state file that
+//     cannot be written stops delivery stickily with the underlying
+//     I/O error, returned unchanged.
 //
 // As on the lower layers, nothing is transmitted before Flush; after a
 // restart the mux journal resends every unconfirmed fragment, so Flush
@@ -117,6 +128,38 @@ type FragFrame struct {
 	Payload []byte
 }
 
+// Pressure is a read-only snapshot of one channel's adaptive flow
+// control state, returned by (*FragSession).Pressure.
+type Pressure struct {
+	// InFlight is the number of written data fragments the peer has not
+	// yet confirmed.
+	InFlight int
+	// Quota is the channel's current adaptive in-flight quota in
+	// fragments, always within [1, window width].
+	Quota int
+	// Backpressure reports whether a writer is currently suspended
+	// waiting for quota to free.
+	Backpressure bool
+}
+
+// fragWaiter is one suspended writer in a channel's arrival-order queue.
+type fragWaiter struct {
+	ready chan struct{} // capacity 1; signalled when the head should recheck
+}
+
+// fragFlow is one channel's adaptive flow-control state. seqs holds the
+// mux sequences of the channel's written but unconfirmed data fragments
+// in ascending order, so the in-flight count is exactly len(seqs).
+type fragFlow struct {
+	quota          int      // current adaptive quota, within [1, window]
+	seqs           []uint32 // unconfirmed data fragment sequences
+	tx             uint32   // transmission high-water: mux seqs below it went out at least once
+	muxFull        bool     // the last mux write found the window full of control frames
+	persistedQuota int      // quota as of the last durable state write
+	waiters        []*fragWaiter
+	sleeping       int // waiters currently suspended (backpressure)
+}
+
 // fragRecv is one channel's receive-side reassembly state. While a
 // message is being assembled, buf holds the chunks received so far;
 // every chunk in an incomplete message is exactly FragMaxPayload bytes,
@@ -147,6 +190,11 @@ type FragSession struct {
 	sendNext []uint32
 	recv     []fragRecv
 	rerr     error
+
+	// window is the per-channel quota ceiling: the mux window width.
+	// flow holds each channel's adaptive quota and in-flight accounting.
+	window int
+	flow   []fragFlow
 
 	// ackPoke coalescingly wakes the acknowledgement pump (capacity 1 is
 	// enough because acks are cumulative and the pump reads the latest
@@ -184,24 +232,32 @@ func NewFrag(m *Mux, cfg FragConfig) (*FragSession, error) {
 		channels: nch,
 		sendNext: make([]uint32, nch),
 		recv:     make([]fragRecv, nch),
+		window:   m.cfg.Window,
+		flow:     make([]fragFlow, nch),
 		ackPoke:  make(chan struct{}, 1),
 		syncCh:   make(chan chan struct{}),
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
 	for ch := 0; ch < nch; ch++ {
-		sendNext, rc, err := loadFragState(cfg.StateDir, uint16(ch), cfg.MaxMessage)
+		sendNext, quota, rc, err := loadFragState(cfg.StateDir, uint16(ch), cfg.MaxMessage, m.cfg.Window)
 		if err != nil {
 			return nil, err
 		}
 		fs.sendNext[ch] = sendNext
 		fs.recv[ch] = rc
+		// The adaptive quota resumes from the recovered value and keeps
+		// adjusting from there; a fresh channel starts at the ceiling.
+		fs.flow[ch].quota = quota
+		fs.flow[ch].persistedQuota = quota
 	}
 
 	// The mux journal may hold fragments newer than the last persisted
 	// send position (a crash between journaling and the state write):
 	// resume numbering past anything already journaled so a rewritten
 	// message can never collide with one the peer may have received.
+	// The same scan rebuilds the in-flight fragment set: every journaled
+	// data fragment past the channel's confirmed position is unconfirmed.
 	for _, rec := range m.log.recs {
 		if int(rec.ch) >= nch {
 			continue
@@ -212,6 +268,9 @@ func NewFrag(m *Mux, cfg FragConfig) (*FragSession, error) {
 		}
 		if msg+1 > fs.sendNext[rec.ch] {
 			fs.sendNext[rec.ch] = msg + 1
+		}
+		if rec.seq >= m.sc[rec.ch].acked {
+			fs.flow[rec.ch].seqs = append(fs.flow[rec.ch].seqs, rec.seq)
 		}
 	}
 
@@ -225,12 +284,21 @@ func NewFrag(m *Mux, cfg FragConfig) (*FragSession, error) {
 // its fragments can never interleave with another message of the same
 // channel.
 //
-// It returns ErrTooLarge for a payload larger than the configured
-// reassembly cap, ErrChecksum for a channel number outside the session,
-// ErrWindowFull (the same value as ErrTooLarge) when the channel's
-// in-flight quota is already exhausted, and ErrChannelClosed when the
-// channel's write side has been closed. A rejected payload is neither
-// queued nor journaled and consumes no message or frame sequence.
+// It returns ErrTooLarge before doing anything else - no waiting, no
+// buffering - when the payload is larger than the configured
+// reassembly cap, or when the message splits into more fragments than
+// the per-channel window width (it can then never fit the in-flight
+// quota); ErrChecksum for a channel number outside the session; and
+// ErrChannelClosed when the channel's write side has been closed. A
+// rejected payload is neither queued nor journaled and consumes no
+// message or frame sequence, so it takes no quota.
+//
+// A merely quota-tight channel is no error: the call suspends without
+// consuming a sequence and completes in arrival order as soon as the
+// channel's in-flight count leaves room for the whole message. While
+// suspended it stays on the channel's wait queue, so writes complete
+// strictly in call-arrival order and the in-flight count never crosses
+// the channel's current quota.
 func (fs *FragSession) WriteFrame(f FragFrame) error {
 	if len(f.Payload) > fs.cfg.MaxMessage {
 		return ErrTooLarge
@@ -238,16 +306,83 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 	if int(f.Channel) >= fs.channels {
 		return ErrChecksum
 	}
-
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	msg := fs.sendNext[f.Channel]
-	total := uint32(len(f.Payload))
+	// One empty message is exactly one empty fragment.
 	n := 1
 	if len(f.Payload) > 0 {
 		n = (len(f.Payload) + FragMaxPayload - 1) / FragMaxPayload
 	}
+	if n > fs.window {
+		// A message wider than the window can never enter the quota even
+		// with it relaxed to the ceiling: reject it before it waits.
+		return ErrTooLarge
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	ch := f.Channel
+	w := &fragWaiter{ready: make(chan struct{}, 1)}
+	fl := &fs.flow[ch]
+	fl.waiters = append(fl.waiters, w)
+	// Leaving for any reason drops this entry and lets the next waiter in
+	// arrival order recheck.
+	defer func() {
+		fl.waiters = removeWaiter(fl.waiters, w)
+		fs.wakeHeadLocked(ch)
+	}()
+
+	var frames []ChannelFrame
+	for {
+		fs.refreshFlowLocked(ch)
+		if _, _, closed := fs.mux.sendState(ch); closed {
+			return ErrChannelClosed
+		}
+		if fl.waiters[0] == w && !fl.muxFull && len(fl.seqs)+n <= fl.quota {
+			if frames == nil {
+				frames = fs.buildFramesLocked(ch, f, n)
+			}
+			start, err := fs.mux.writeFragments(frames)
+			if err == nil {
+				for i := 0; i < n; i++ {
+					fl.seqs = append(fl.seqs, start+uint32(i))
+				}
+				break
+			}
+			if errors.Is(err, ErrChannelClosed) {
+				return ErrChannelClosed
+			}
+			if errors.Is(err, ErrWindowFull) {
+				// The mux window is momentarily full of control frames
+				// (standalone acknowledgements, a FIN): this is
+				// backpressure like any other, not a rejection. Wait for
+				// the next acknowledgement to drain it.
+				fl.muxFull = true
+			} else {
+				// A journal failure leaves the message unnumbered; the
+				// caller may retry a still-open channel.
+				return err
+			}
+		}
+		fl.sleeping++
+		fs.mu.Unlock()
+		<-w.ready
+		fs.mu.Lock()
+		fl.sleeping--
+	}
+
+	fs.sendNext[ch]++
+	// The send position is durable before the write returns: after a
+	// restart, numbering must never reuse a message sequence the peer
+	// may already have received.
+	return fs.persistLocked(ch)
+}
+
+// buildFramesLocked slices f's payload into its n ordered fragments on
+// channel ch, numbered with the channel's next message sequence and
+// piggybacking the current receive position. Caller holds mu.
+func (fs *FragSession) buildFramesLocked(ch uint16, f FragFrame, n int) []ChannelFrame {
+	msg := fs.sendNext[ch]
+	total := uint32(len(f.Payload))
 	frames := make([]ChannelFrame, 0, n)
 	for i := 0; i < n; i++ {
 		lo := i * FragMaxPayload
@@ -260,21 +395,83 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 			flags = fhFlagLast
 		}
 		frames = append(frames, ChannelFrame{
-			Channel: f.Channel,
+			Channel: ch,
 			Flags:   f.Flags,
 			Kind:    f.Kind,
 			Payload: encodeFragHeader(msg, uint32(i), total, flags,
-				fs.recv[f.Channel].next, f.Payload[lo:hi]),
+				fs.recv[ch].next, f.Payload[lo:hi]),
 		})
 	}
-	if err := fs.mux.writeFragments(frames); err != nil {
-		return err
+	return frames
+}
+
+// removeWaiter drops w from the channel's wait queue.
+func removeWaiter(ws []*fragWaiter, w *fragWaiter) []*fragWaiter {
+	for i, x := range ws {
+		if x == w {
+			return append(ws[:i], ws[i+1:]...)
+		}
 	}
-	fs.sendNext[f.Channel]++
-	// The send position is durable before the write returns: after a
-	// restart, numbering must never reuse a message sequence the peer
-	// may already have received.
-	return fs.persistLocked(f.Channel)
+	return ws
+}
+
+// wakeHeadLocked signals the channel's head waiter to recheck. Caller
+// holds mu.
+func (fs *FragSession) wakeHeadLocked(ch uint16) {
+	fl := &fs.flow[ch]
+	if len(fl.waiters) == 0 {
+		return
+	}
+	select {
+	case fl.waiters[0].ready <- struct{}{}:
+	default:
+	}
+}
+
+// Pressure returns a read-only snapshot of one channel's flow-control
+// state: the in-flight fragment count, the current adaptive quota and
+// whether a writer is suspended waiting for quota on the channel. An
+// out-of-range channel reports the zero value. The call changes no
+// state; the snapshot reflects acknowledgements already observed by
+// ReadFrame or Flush.
+func (fs *FragSession) Pressure(ch uint16) Pressure {
+	if int(ch) >= fs.channels {
+		return Pressure{}
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fl := &fs.flow[ch]
+	return Pressure{
+		InFlight:     len(fl.seqs),
+		Quota:        fl.quota,
+		Backpressure: fl.sleeping > 0,
+	}
+}
+
+// refreshFlowLocked reconciles one channel's in-flight accounting with
+// the mux send positions: confirmed fragments leave the in-flight set,
+// and every confirmed fragment relaxes the adaptive quota by one up to
+// the window ceiling (timely acknowledgement widens the channel). A
+// freed mux window clears the control-frame full mark. The head waiter
+// is woken last so suspended writes recheck their room. Caller holds mu.
+func (fs *FragSession) refreshFlowLocked(ch uint16) {
+	fl := &fs.flow[ch]
+	next, acked, _ := fs.mux.sendState(ch)
+	k := 0
+	for k < len(fl.seqs) && fl.seqs[k] < acked {
+		k++
+	}
+	if k > 0 {
+		fl.seqs = append(fl.seqs[:0], fl.seqs[k:]...)
+		fl.quota += k
+		if fl.quota > fs.window {
+			fl.quota = fs.window
+		}
+	}
+	if fl.muxFull && next-acked < uint32(fs.window) {
+		fl.muxFull = false
+	}
+	fs.wakeHeadLocked(ch)
 }
 
 // Flush sends every queued fragment through the wrapped mux: fragments
@@ -282,8 +479,54 @@ func (fs *FragSession) WriteFrame(f FragFrame) error {
 // interleaved with other channels' frames but never overtake an earlier
 // fragment of their own channel. After a restart the queue was reloaded
 // from the journal, so Flush is also the retransmit operation.
+//
+// Flush is also where the adaptive quotas tighten: a frame handed to
+// the reliable session again after being transmitted before is a
+// retransmission, and any retransmission on a channel halves its quota
+// (never below 1). Acknowledgement-driven relaxation happens as acks
+// are observed, independently per channel; neither adjustment touches
+// the round-robin order or any channel's fragment order. A tightened
+// quota is made durable with the channel's state before Flush returns.
 func (fs *FragSession) Flush() error {
-	return fs.mux.Flush()
+	if err := fs.mux.Flush(); err != nil {
+		return err
+	}
+	sent := fs.mux.lastSentSeqs()
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	retrans := make([]bool, fs.channels)
+	for _, s := range sent {
+		if int(s.ch) >= fs.channels {
+			continue
+		}
+		fl := &fs.flow[s.ch]
+		if s.seq < fl.tx {
+			retrans[s.ch] = true
+		} else {
+			fl.tx = s.seq + 1
+		}
+	}
+	var perr error
+	for ch := 0; ch < fs.channels; ch++ {
+		fs.refreshFlowLocked(uint16(ch))
+		fl := &fs.flow[ch]
+		if retrans[ch] {
+			if q := fl.quota / 2; q > 1 {
+				fl.quota = q
+			} else {
+				fl.quota = 1
+			}
+		}
+		if fl.quota != fl.persistedQuota {
+			// Keep the recovered quota current: a restart resumes
+			// adjusting from the last durable value.
+			if err := fs.persistLocked(uint16(ch)); err != nil && perr == nil {
+				perr = err
+			}
+		}
+	}
+	return perr
 }
 
 // ReadFrame returns the next completely reassembled message across all
@@ -298,7 +541,9 @@ func (fs *FragSession) Flush() error {
 // old message generation, one beyond the current receive position, a
 // same-position duplicate with different content, an acknowledgement
 // past the send frontier, an unknown flag, a malformed standalone
-// acknowledgement, and a damaged fragment header. Mux results (the
+// acknowledgement, and a damaged fragment header. A reassembly state
+// file that cannot be written stops delivery stickily as well, with the
+// underlying I/O error returned unchanged. Mux results (the
 // per-channel io.EOF at a channel's FIN, the transport's io.EOF,
 // ErrShortFrame, outer checksum/version/size and reader errors) pass
 // through unchanged.
@@ -326,6 +571,16 @@ func (fs *FragSession) ReadFrame() (FragFrame, error) {
 		// lower layers: sends and ack processing must keep moving while
 		// this waits for bytes.
 		cf, rerr := fs.mux.ReadFrame()
+
+		// Acknowledgements the mux reader just consumed may have
+		// confirmed fragments: reconcile every channel's flow state and
+		// wake suspended writers before doing anything else.
+		fs.mu.Lock()
+		for ch := 0; ch < fs.channels; ch++ {
+			fs.refreshFlowLocked(uint16(ch))
+		}
+		fs.mu.Unlock()
+
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				// A channel's FIN (or the transport end) passes through
@@ -444,8 +699,12 @@ func (fs *FragSession) ReadFrame() (FragFrame, error) {
 		}
 		// Write the reassembly state through before the mux can
 		// acknowledge this fragment past the sender: after a restart the
-		// assembly resumes from exactly this position.
-		_ = fs.persistLocked(ch)
+		// assembly resumes from exactly this position. A persist failure
+		// is not swallowed: delivery stops stickily with the underlying
+		// I/O error returned unchanged.
+		if err := fs.persistLocked(ch); err != nil {
+			return fs.failReadLocked(err)
+		}
 		fs.signalAckLocked()
 		fs.mu.Unlock()
 	}
@@ -554,16 +813,37 @@ func (fs *FragSession) sendAcks(sent []uint32) {
 // CloseChannel closes the write side of ch through the wrapped mux and
 // waits for the acknowledgement pump to wind down before returning, so
 // every position delivered before the close is on its way to the peer.
-// Closing (or writing to) an already closed channel returns
-// ErrChannelClosed; an out-of-range channel returns ErrChecksum. Both
-// values compare equal to the established sentinels directly.
+// The FIN takes one in-flight slot like a data frame: a channel whose
+// adaptive quota has no room, or whose wait queue still holds suspended
+// writes, returns ErrWindowFull (the same value as ErrTooLarge) and the
+// close is retried after acknowledgements arrive, exactly like the
+// lower layers. Closing (or writing to) an already closed channel
+// returns ErrChannelClosed; an out-of-range channel returns ErrChecksum.
+// Both values compare equal to the established sentinels directly.
 func (fs *FragSession) CloseChannel(ch uint16) error {
 	if int(ch) >= fs.channels {
 		return ErrChecksum
 	}
+	fs.mu.Lock()
+	fs.refreshFlowLocked(ch)
+	fl := &fs.flow[ch]
+	// The FIN queues behind every already accepted or suspended write
+	// and needs one quota slot of its own; without room the caller
+	// retries later, as on the mux layer.
+	full := len(fl.waiters) > 0 || len(fl.seqs)+1 > fl.quota
+	fs.mu.Unlock()
+	if full {
+		return ErrWindowFull
+	}
 	if err := fs.mux.CloseChannel(ch); err != nil {
 		return err
 	}
+	// A writer suspended on this channel's quota must observe the close
+	// and return ErrChannelClosed instead of waiting forever; each
+	// woken waiter wakes the next as it leaves the queue.
+	fs.mu.Lock()
+	fs.wakeHeadLocked(ch)
+	fs.mu.Unlock()
 	// Rendezvous with the pump: it answers after flushing every
 	// acknowledgement queued so far. If it already stopped (Close), or
 	// stops before answering, the rendezvous completes immediately.
@@ -667,13 +947,15 @@ func checkFragChunk(total, idx uint32, last bool, chunk []byte) error {
 // Durable state: one checksummed reassembly state file per channel,
 // rewritten atomically via temp file + rename on every accepted
 // fragment, so an interrupted reassembly resumes from the last confirmed
-// position and a delivered message is never delivered twice.
+// position and a delivered message is never delivered twice. The file
+// also carries the channel's adaptive quota, so a restart resumes
+// adjusting from the recovered value.
 //
 // File layout (all multi-byte fields big-endian):
 //
-//	+------------+------------+----------+-----------------------+----------+
-//	| send (4)   | recv (4)   | mode (1) | [partial record]      | crc32(4) |
-//	+------------+------------+----------+-----------------------+----------+
+//	+------------+------------+-----------+----------+-----------------------+----------+
+//	| send (4)   | recv (4)   | quota (4) | mode (1) | [partial record]      | crc32(4) |
+//	+------------+------------+-----------+----------+-----------------------+----------+
 //
 // mode 0 carries no partial record. mode 1 (assembly in progress)
 // carries: total(4) flags(2) kind(1) datalen(4) data(datalen).
@@ -683,7 +965,7 @@ const (
 	fragStatePrefix = "frag"
 	fragStateSuffix = ".state"
 
-	fragStateHdrSize = 4 + 4 + 1 // sendNext + recvNext + mode
+	fragStateHdrSize = 4 + 4 + 4 + 1 // sendNext + recvNext + quota + mode
 
 	fragModeNone    = 0
 	fragModePartial = 1
@@ -693,6 +975,7 @@ const (
 type fragDiskState struct {
 	sendNext uint32
 	recvNext uint32
+	quota    int
 	mode     uint8
 	ptotal   uint32
 	pflags   uint16
@@ -705,12 +988,15 @@ func fragStatePath(dir string, ch uint16) string {
 }
 
 // persistLocked writes the channel's current state through to its state
-// file. Caller holds mu.
+// file, including the adaptive quota so a restart resumes adjusting from
+// it. Caller holds mu.
 func (fs *FragSession) persistLocked(ch uint16) error {
 	rc := &fs.recv[ch]
+	fl := &fs.flow[ch]
 	st := fragDiskState{
 		sendNext: fs.sendNext[ch],
 		recvNext: rc.next,
+		quota:    fl.quota,
 	}
 	if rc.started && !rc.dropping {
 		st.mode = fragModePartial
@@ -719,7 +1005,11 @@ func (fs *FragSession) persistLocked(ch uint16) error {
 		st.pkind = rc.pkind
 		st.pdata = rc.buf
 	}
-	return saveFragState(fs.cfg.StateDir, ch, st)
+	if err := saveFragState(fs.cfg.StateDir, ch, st); err != nil {
+		return err
+	}
+	fl.persistedQuota = fl.quota
+	return nil
 }
 
 func marshalFragState(st fragDiskState) []byte {
@@ -731,6 +1021,7 @@ func marshalFragState(st fragDiskState) []byte {
 	}
 	put32(st.sendNext)
 	put32(st.recvNext)
+	put32(uint32(st.quota))
 	body = append(body, st.mode)
 	if st.mode == fragModePartial {
 		put32(st.ptotal)
@@ -768,19 +1059,20 @@ func saveFragState(dir string, ch uint16, st fragDiskState) error {
 
 // loadFragState reads one channel's state file strictly: every byte must
 // belong to one complete, valid record. A missing file means a fresh
-// channel; a truncated file, a bad CRC, an unknown mode or an
-// inconsistent partial record fails recovery with ErrChecksum rather
-// than reassembling unverified bytes.
-func loadFragState(dir string, ch uint16, maxMessage int) (sendNext uint32, rc fragRecv, err error) {
+// channel (message 0, quota at the window ceiling); a truncated file, a
+// bad CRC, an out-of-range quota, an unknown mode or an inconsistent
+// partial record fails recovery with ErrChecksum rather than
+// reassembling unverified bytes.
+func loadFragState(dir string, ch uint16, maxMessage, window int) (sendNext uint32, quota int, rc fragRecv, err error) {
 	data, err := os.ReadFile(fragStatePath(dir, ch))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fragRecv{}, nil
+			return 0, window, fragRecv{}, nil
 		}
-		return 0, fragRecv{}, err
+		return 0, 0, fragRecv{}, err
 	}
-	fail := func() (uint32, fragRecv, error) {
-		return 0, fragRecv{}, fmt.Errorf("codec: frag state %s corrupted: %w",
+	fail := func() (uint32, int, fragRecv, error) {
+		return 0, 0, fragRecv{}, fmt.Errorf("codec: frag state %s corrupted: %w",
 			filepath.Base(fragStatePath(dir, ch)), ErrChecksum)
 	}
 	if len(data) < fragStateHdrSize+4 {
@@ -792,7 +1084,12 @@ func loadFragState(dir string, ch uint16, maxMessage int) (sendNext uint32, rc f
 	}
 	sendNext = binary.BigEndian.Uint32(body[0:4])
 	rc.next = binary.BigEndian.Uint32(body[4:8])
-	mode := body[8]
+	q := binary.BigEndian.Uint32(body[8:12])
+	if q < 1 || q > uint32(window) {
+		return fail()
+	}
+	quota = int(q)
+	mode := body[12]
 	switch mode {
 	case fragModeNone:
 		if len(body) != fragStateHdrSize {
@@ -802,10 +1099,10 @@ func loadFragState(dir string, ch uint16, maxMessage int) (sendNext uint32, rc f
 		if len(body) < fragStateHdrSize+11 {
 			return fail()
 		}
-		ptotal := binary.BigEndian.Uint32(body[9:13])
-		pflags := binary.BigEndian.Uint16(body[13:15])
-		pkind := body[15]
-		dlen := binary.BigEndian.Uint32(body[16:20])
+		ptotal := binary.BigEndian.Uint32(body[fragStateHdrSize : fragStateHdrSize+4])
+		pflags := binary.BigEndian.Uint16(body[fragStateHdrSize+4 : fragStateHdrSize+6])
+		pkind := body[fragStateHdrSize+6]
+		dlen := binary.BigEndian.Uint32(body[fragStateHdrSize+7 : fragStateHdrSize+11])
 		if len(body) != fragStateHdrSize+11+int(dlen) {
 			return fail()
 		}
@@ -826,5 +1123,5 @@ func loadFragState(dir string, ch uint16, maxMessage int) (sendNext uint32, rc f
 	default:
 		return fail()
 	}
-	return sendNext, rc, nil
+	return sendNext, quota, rc, nil
 }

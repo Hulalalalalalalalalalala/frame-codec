@@ -167,6 +167,10 @@ type Mux struct {
 	// starts handing out opportunities.
 	rr  int
 	log *muxLog
+	// lastSent holds the data sequences the latest Flush handed to the
+	// reliable session, in wire order; the fragmentation layer uses it
+	// to tell first transmissions from retransmissions.
+	lastSent []muxSeq
 
 	rmu sync.Mutex
 	// bases is the per-channel next-due receive sequence; finEOF marks
@@ -389,14 +393,16 @@ func (m *Mux) WriteFrame(f ChannelFrame) error {
 // is not already exhausted; the run itself may carry the count past the
 // quota by one message at most, and the over-quota tail drains through
 // the same reach-limited Flush logic a restart backlog uses. A rejected
-// run is neither queued nor journaled and consumes no sequence.
-func (m *Mux) writeFragments(frames []ChannelFrame) error {
+// run is neither queued nor journaled and consumes no sequence. On
+// success it returns the sequence assigned to the first frame of the
+// run; the rest follow contiguously.
+func (m *Mux) writeFragments(frames []ChannelFrame) (uint32, error) {
 	if len(frames) == 0 {
-		return nil
+		return 0, nil
 	}
 	ch := frames[0].Channel
 	if int(ch) >= m.cfg.Channels {
-		return fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
+		return 0, fmt.Errorf("codec: mux channel %d out of range [0,%d): %w",
 			ch, m.cfg.Channels, ErrChecksum)
 	}
 
@@ -405,14 +411,15 @@ func (m *Mux) writeFragments(frames []ChannelFrame) error {
 
 	c := &m.sc[ch]
 	if c.closed {
-		return ErrChannelClosed
+		return 0, ErrChannelClosed
 	}
 	if c.next-c.acked >= uint32(m.cfg.Window) {
-		return ErrWindowFull
+		return 0, ErrWindowFull
 	}
+	start := c.next
 	for _, f := range frames {
 		if len(f.Payload) > MuxMaxPayload {
-			return ErrTooLarge
+			return 0, ErrTooLarge
 		}
 		qf := queuedFrame{
 			channel: ch,
@@ -422,13 +429,24 @@ func (m *Mux) writeFragments(frames []ChannelFrame) error {
 			payload: append([]byte(nil), f.Payload...),
 		}
 		if err := m.log.append(qf); err != nil {
-			return err
+			return 0, err
 		}
 		c.open = true
 		c.next++
 		m.queue = append(m.queue, &qf)
 	}
-	return nil
+	return start, nil
+}
+
+// sendState reports one channel's next send sequence, its confirmed
+// position and whether its write side is closed. It serves the
+// fragmentation layer's flow-control accounting and changes none of the
+// mux's public entries, constants or error semantics.
+func (m *Mux) sendState(ch uint16) (next, acked uint32, closed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := &m.sc[ch]
+	return c.next, c.acked, c.closed
 }
 
 // CloseChannel closes the write side of ch. The FIN is itself a framed
@@ -509,6 +527,7 @@ func (m *Mux) Flush() error {
 	// there, flush the accepted prefix and leave every unhanded frame
 	// queued for the next Flush; the receiver deduplicates the overlap.
 	lastServed := -1
+	var sent []muxSeq
 	for i := range out {
 		err := m.rel.WriteFrame(out[i])
 		if errors.Is(err, ErrWindowFull) {
@@ -518,8 +537,11 @@ func (m *Mux) Flush() error {
 			return err
 		}
 		// out is one data frame per queued entry; recover its channel
-		// from its mux header rather than re-planning.
-		lastServed = int(binary.BigEndian.Uint16(out[i].Payload[mhChanOff:mhSeqOff]))
+		// and sequence from its mux header rather than re-planning.
+		ch := binary.BigEndian.Uint16(out[i].Payload[mhChanOff:mhSeqOff])
+		sent = append(sent, muxSeq{ch: ch,
+			seq: binary.BigEndian.Uint32(out[i].Payload[mhSeqOff:mhFlagOff])})
+		lastServed = int(ch)
 	}
 	if err := m.rel.Flush(); err != nil {
 		return err
@@ -528,12 +550,24 @@ func (m *Mux) Flush() error {
 	// Advance the round-robin cursor only past channels that actually
 	// got a frame onto the wire this Flush, and only after the lower
 	// flush succeeded: a failed Flush retries from the same channel.
+	m.mu.Lock()
+	m.lastSent = sent
 	if lastServed >= 0 {
-		m.mu.Lock()
 		m.rr = (lastServed + 1) % m.cfg.Channels
-		m.mu.Unlock()
 	}
+	m.mu.Unlock()
 	return nil
+}
+
+// lastSentSeqs returns the data sequences the latest Flush handed to
+// the reliable session, in wire order. It serves the fragmentation
+// layer's retransmission detection and changes no public behavior.
+func (m *Mux) lastSentSeqs() []muxSeq {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]muxSeq, len(m.lastSent))
+	copy(out, m.lastSent)
+	return out
 }
 
 // buildFlushLocked returns the data frames of one Flush in wire order.
